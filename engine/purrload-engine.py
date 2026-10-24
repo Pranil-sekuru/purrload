@@ -206,10 +206,11 @@ class DirectJob:
     def __init__(self, url):
         self.id = str(uuid.uuid4())
         self.url = url
-        self.torrent = url.startswith("magnet:") or url.lower().endswith(".torrent")
+        # a magnet, a .torrent file on disk, or a web link to a .torrent file (query strings allowed)
+        self.torrent = url.startswith("magnet:") or urlparse(url).path.lower().endswith(".torrent")
         self.folder = os.path.join(DOWNLOADS, "Torrents") if self.torrent else DOWNLOADS
         self.name = self.title = "Magnet link" if url.startswith("magnet:") else (
-            os.path.basename(url) if self.torrent else os.path.basename(urlparse(url).path) or "download")
+            os.path.basename(urlparse(url).path) or "download")
         self.state = "starting"          # starting -> metadata (magnets) -> downloading -> verified | corrupt | danger
         self.message = ""
         self.total = 0
@@ -297,8 +298,23 @@ class DirectJob:
         if not ARIA2:
             return self.fail("torrents need aria2: brew install aria2")
         work = tempfile.mkdtemp(prefix="purrload-")
+        try:
+            self.torrent_in(work)
+        finally:
+            shutil.rmtree(work, ignore_errors=True)   # the fetched .torrent / magnet metadata
+
+    def torrent_in(self, work):
         tor = self.url
-        if self.url.startswith("magnet:"):
+        if re.match(r"https?://", self.url):         # a web link to a .torrent file: fetch it first
+            tor = os.path.join(work, "download.torrent")
+            r = subprocess.run(["curl", "-sSL", "--max-time", "60", "--max-filesize", "50000000", "-o", tor, self.url],
+                               capture_output=True, text=True)
+            if r.returncode != 0 or not os.path.exists(tor):
+                return self.fail(f"couldn't fetch the .torrent file ({(r.stderr.strip() or 'no response')[:80]})")
+            with open(tor, "rb") as f:
+                if f.read(1) != b"d":                # torrents are bencoded dictionaries; an HTML error page isn't
+                    return self.fail("the link didn't return a .torrent file (the site may need you to log in)")
+        elif self.url.startswith("magnet:"):
             self.state = "metadata"
             self.run = Runner([ARIA2, "-d", work, "--bt-metadata-only=true", "--bt-save-metadata=true",
                                "--bt-stop-timeout=120", "--console-log-level=error", "--summary-interval=0", self.url], False)
@@ -308,8 +324,11 @@ class DirectJob:
                 return self.fail("no peers sent the file list; try again later")
             tor = os.path.join(work, found[0])
         plan = subprocess.run([sys.executable, "-I", INSPECT, "plan", tor, "0"], capture_output=True, text=True)
-        if plan.returncode != 0:
+        if plan.returncode == 2:                     # the planner's "nothing safe to download" answer
             return self.fail("skipped: no video, audio or subtitles in it", "skipped")
+        if plan.returncode != 0:                     # anything else is a real error: say so, don't call it "no media"
+            err = (plan.stderr.strip().splitlines() or ["unknown error"])[-1]
+            return self.fail(f"couldn't read the torrent: {err[:100]}")
         name, sel, size = plan.stdout.strip().split("\n")[-3:]
         self.set_name(name)
         self.total = int(size)
