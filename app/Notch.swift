@@ -85,6 +85,7 @@ struct NotchView: View {
                 model.watchClipboard.toggle()
             }
             PitMenu()
+            EngineMenu(model: model)
             Button("Move to corner") { model.switchMode?() }
             Divider()
             Button("Quit") { NSApp.terminate(nil) }

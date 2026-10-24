@@ -1,11 +1,12 @@
-// Keeps the engine alive without any app owning it. An engine started from a terminal or another app dies when that
-// app quits; a launchd agent starts it at login and restarts it if it stops. Purrload asks once, then copies the
-// bundled engine to Application Support (a path that survives moving the app) and registers
-// ~/Library/LaunchAgents/<label>.plist. scripts/install-engine-agent.sh does the same from a checkout, and its
-// --remove undoes either.
+// How the engine runs. Either launchd keeps it going (starts at login, restarts it if it stops: the user turns this
+// on), or Purrload runs it only while the app is open and stops it on quit. Either way it runs from inside the signed
+// app, never from a copy somewhere writable, and the app checks its own signature before letting it run.
+// Right-click → Background engine has the switches and Uninstall. scripts/install-engine-agent.sh is the same agent
+// for a checkout; its --remove undoes either.
 import SwiftUI
 import AppKit
 import ServiceManagement
+import Security
 
 struct AgentError: LocalizedError {
     let errorDescription: String?
@@ -15,16 +16,39 @@ struct AgentError: LocalizedError {
 enum EngineAgent {
     static let label = "io.github.pranil-sekuru.purrload-engine"
     static let python = "/usr/bin/python3"
+    static let path = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"   // where aria2 usually lives
 
     static var plistURL: URL {
         FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/LaunchAgents/\(label).plist")
     }
-    static func engineCopy(_ base: URL) -> URL { base.appendingPathComponent("engine/purrload-engine.py") }
     static var bundledEngine: URL? { Bundle.main.url(forResource: "purrload-engine", withExtension: "py", subdirectory: "engine") }
     static var isInstalled: Bool { FileManager.default.fileExists(atPath: plistURL.path) }
+    static var opensAtLogin: Bool { SMAppService.mainApp.status == .enabled }
+
+    /// The engine the installed agent runs (older versions ran a copy in Application Support).
+    static var installedEnginePath: String? {
+        guard let d = try? Data(contentsOf: plistURL),
+              let p = try? PropertyListSerialization.propertyList(from: d, format: nil) as? [String: Any] else { return nil }
+        return (p["ProgramArguments"] as? [String])?.last
+    }
+
+    /// False if any file in the app (the engine included) changed after it was signed.
+    static var appIsIntact: Bool {
+        var code: SecStaticCode?
+        guard SecStaticCodeCreateWithPath(Bundle.main.bundleURL as CFURL, [], &code) == errSecSuccess, let code else { return false }
+        return SecStaticCodeCheckValidity(code, SecCSFlags(rawValue: kSecCSStrictValidate), nil) == errSecSuccess
+    }
+
+    static func engine() throws -> URL {
+        guard let e = bundledEngine else { throw AgentError("This build of Purrload has no engine inside it.") }
+        guard appIsIntact else {
+            throw AgentError("Purrload's files were changed after it was built, so its engine won't run. Reinstall Purrload.")
+        }
+        return e
+    }
 
     static func plistData(base: URL, engine: URL) throws -> Data {
-        var env = ["PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"]   // where aria2 usually lives
+        var env = ["PATH": path]
         if ProcessInfo.processInfo.environment["PURRLOAD_HOME"] != nil { env["PURRLOAD_HOME"] = base.path }
         let plist: [String: Any] = [
             "Label": label,
@@ -53,44 +77,99 @@ enum EngineAgent {
         return (p.terminationStatus, String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines))
     }
 
-    /// Put the bundled engine where launchd will run it: every file of it (it runs inspect.py to read torrents).
-    /// Returns the engine's path.
-    @discardableResult
-    static func copyEngine(base: URL) throws -> URL {
-        guard let bundled = bundledEngine else { throw AgentError("This build of Purrload has no engine inside it.") }
-        let fm = FileManager.default, src = bundled.deletingLastPathComponent(), dest = engineCopy(base).deletingLastPathComponent()
-        try fm.createDirectory(at: dest, withIntermediateDirectories: true)
-        for name in try fm.contentsOfDirectory(atPath: src.path) where name.hasSuffix(".py") {
-            let data = try Data(contentsOf: src.appendingPathComponent(name)), to = dest.appendingPathComponent(name)
-            if (try? Data(contentsOf: to)) != data { try data.write(to: to, options: .atomic) }
-        }
-        return engineCopy(base)
+    /// Ask every engine to stop (each saves its downloads first) and wait; aria2 can be slow to let go of a USB drive.
+    static func stopEngines() {
+        run("/usr/bin/pkill", ["-TERM", "-f", "purrload-engine.py"])
+        for _ in 0..<60 where run("/usr/bin/pgrep", ["-f", "purrload-engine.py"]).status == 0 { Thread.sleep(forTimeInterval: 1) }
     }
 
-    /// After an app update: bring the copy up to date. A running engine keeps its old code until its next restart,
-    /// so a download is never interrupted for this.
-    static func refreshCopy(base: URL) {
-        guard isInstalled else { return }
-        _ = try? copyEngine(base: base)
-    }
-
-    /// Takes a while (it waits for an engine started by hand to stop), so call it off the main thread.
+    /// Takes a while (it waits for the running engine to stop), so call it off the main thread.
     static func install(base: URL) throws {
-        let engine = try copyEngine(base: base)
+        let engine = try engine()
         try FileManager.default.createDirectory(at: plistURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         try plistData(base: base, engine: engine).write(to: plistURL, options: .atomic)
         let domain = "gui/\(getuid())"
         run("/bin/launchctl", ["bootout", "\(domain)/\(label)"])         // an earlier copy of this agent, if any
-        // an engine somebody started by hand: it saves its downloads when asked to stop, and the new one picks them up
-        run("/usr/bin/pkill", ["-TERM", "-f", "purrload-engine.py"])
-        for _ in 0..<60 where run("/usr/bin/pgrep", ["-f", "purrload-engine.py"]).status == 0 { Thread.sleep(forTimeInterval: 1) }
+        stopEngines()                                                    // one the app runs, or one started by hand
         let r = run("/bin/launchctl", ["bootstrap", domain, plistURL.path])
         if r.status != 0 { throw AgentError("launchctl said: \(r.out)") }
+        try? FileManager.default.removeItem(at: base.appendingPathComponent("engine"))   // the copy older versions ran
     }
 
-    /// Open Purrload itself at login too, so the notch is back after a restart without anyone starting it.
-    static func openAppAtLogin() throws {
-        if SMAppService.mainApp.status != .enabled { try SMAppService.mainApp.register() }
+    /// Off: launchd stops the engine (it saves its downloads) and forgets it. Call it off the main thread.
+    static func remove() {
+        run("/bin/launchctl", ["bootout", "gui/\(getuid())/\(label)"])
+        try? FileManager.default.removeItem(at: plistURL)
+        stopEngines()
+    }
+
+    static func setOpensAtLogin(_ on: Bool) throws {
+        if on { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
+    }
+
+    // MARK: running with the app, when the agent is off
+
+    nonisolated(unsafe) static var child: Process?
+
+    static func startWithApp(base: URL) {
+        guard !isInstalled, child?.isRunning != true, let engine = try? engine() else { return }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: python)
+        p.arguments = ["-I", engine.path]
+        var env = ProcessInfo.processInfo.environment
+        env["PATH"] = path                // opened from Finder the app has no Homebrew on its PATH, so no aria2
+        env["PURRLOAD_HOME"] = base.path
+        p.environment = env
+        p.standardOutput = FileHandle.nullDevice
+        let log = base.appendingPathComponent("crash.log")
+        if !FileManager.default.fileExists(atPath: log.path) { FileManager.default.createFile(atPath: log.path, contents: nil) }
+        if let h = try? FileHandle(forWritingTo: log) { h.seekToEndOfFile(); p.standardError = h }
+        if (try? p.run()) != nil { child = p }    // if an engine is already running, this one exits at once (its lock)
+    }
+
+    /// On quit: SIGTERM, so it saves its downloads and stops aria2.
+    static func stopWithApp() {
+        child?.terminate()
+        child = nil
+    }
+
+    // MARK: kept up to date while the app runs
+
+    nonisolated(unsafe) static var working = false
+    nonisolated(unsafe) static var warnedTampered = false
+
+    /// At launch and every 30 s: run the engine the right way, and point an old agent at this app's engine
+    /// (that restarts the engine, so only when nothing is downloading).
+    @MainActor
+    static func maintain(model: Model) {
+        guard !working else { return }
+        if bundledEngine != nil && !appIsIntact {
+            if isInstalled { working = true; Task.detached { remove(); working = false } }
+            if !warnedTampered {
+                warnedTampered = true
+                let a = NSAlert()
+                a.messageText = "Purrload's engine is turned off"
+                a.informativeText = "Purrload's files were changed after it was built, so it won't run its engine. "
+                    + "Reinstall Purrload to fix this."
+                a.runModal()
+            }
+            return
+        }
+        if !isInstalled { return startWithApp(base: model.base) }
+        if let e = bundledEngine?.path, installedEnginePath != e, model.activeJobs.isEmpty {
+            working = true
+            let base = model.base
+            Task.detached { try? install(base: base); working = false }
+        }
+    }
+
+    /// Remove everything Purrload added outside its own folder, its settings and saved list, then the app itself.
+    /// Downloaded files are left alone. Call it off the main thread.
+    static func uninstall(base: URL) {
+        remove()
+        try? SMAppService.mainApp.unregister()
+        try? FileManager.default.removeItem(at: base)
+        if let id = Bundle.main.bundleIdentifier { UserDefaults.standard.removePersistentDomain(forName: id) }
     }
 }
 
@@ -99,15 +178,16 @@ enum EngineAgentPrompt {
     /// Ask once whether to run on its own: the engine as a launchd agent, the app as a login item.
     /// After a "Not now" it asks again only if the engine isn't running.
     static func askIfNeeded(model: Model) {
-        let needAgent = !EngineAgent.isInstalled, needApp = SMAppService.mainApp.status != .enabled
-        guard needAgent || needApp, EngineAgent.bundledEngine != nil else { return }
-        if UserDefaults.standard.bool(forKey: "engineAgentDeclined") && model.guardRunning { return }
+        let needAgent = !EngineAgent.isInstalled, needApp = !EngineAgent.opensAtLogin
+        guard needAgent || needApp, EngineAgent.bundledEngine != nil, EngineAgent.appIsIntact else { return }
+        if UserDefaults.standard.object(forKey: "engineAgentDeclined") != nil { return }
 
         let alert = NSAlert()
         alert.messageText = "Keep Purrload running on its own?"
-        alert.informativeText = "Purrload downloads through a small helper in the background. If Purrload opens at login "
-            + "and the helper restarts itself when it stops, downloads keep going after you quit other apps or restart "
-            + "your Mac. You can turn it off any time in System Settings › General › Login Items & Extensions."
+        alert.informativeText = "Purrload downloads through a small helper. If Purrload opens at login and the helper keeps "
+            + "running in the background, downloads carry on after you quit apps or restart your Mac.\n\n"
+            + "Not now: downloads run only while Purrload is open. You can change this any time: right-click Purrload › "
+            + "Background engine."
         alert.addButton(withTitle: "Turn on")
         alert.addButton(withTitle: "Not now")
         NSApp.activate(ignoringOtherApps: true)
@@ -115,26 +195,82 @@ enum EngineAgentPrompt {
             UserDefaults.standard.set(true, forKey: "engineAgentDeclined")
             return
         }
-        UserDefaults.standard.removeObject(forKey: "engineAgentDeclined")
         var problems: [String] = []
-        do { try EngineAgent.openAppAtLogin() } catch { problems.append("Opening at login: \(error.localizedDescription)") }
+        do { try EngineAgent.setOpensAtLogin(true) } catch { problems.append("Opening at login: \(error.localizedDescription)") }
         if !needAgent { return report(problems, model: model) }
-        model.announce("Starting the engine…")
+        setAgent(true, model: model, problems: problems)
+    }
+
+    static func setAgent(_ on: Bool, model: Model, problems: [String] = []) {
+        var problems = problems
+        model.announce(on ? "Starting the engine…" : "Engine runs while Purrload is open")
         let base = model.base
+        EngineAgent.working = true
         Task.detached {
-            let result = Result { try EngineAgent.install(base: base) }
+            let failure: String?
+            if on {
+                do { try EngineAgent.install(base: base); failure = nil } catch { failure = "The engine: \(error.localizedDescription)" }
+            } else { EngineAgent.remove(); failure = nil }
             await MainActor.run {
-                if case .failure(let e) = result { problems.append("The engine: \(e.localizedDescription)") }
-                report(problems, model: model)
+                EngineAgent.working = false
+                if let failure { problems.append(failure) }
+                if !on { EngineAgent.startWithApp(base: base) }
+                report(problems, model: model, done: on ? "Purrload will keep running" : nil)
             }
         }
     }
 
-    static func report(_ problems: [String], model: Model) {
-        guard !problems.isEmpty else { return model.announce("Purrload will keep running") }
+    static func setOpensAtLogin(_ on: Bool, model: Model) {
+        do { try EngineAgent.setOpensAtLogin(on) } catch { report(["Opening at login: \(error.localizedDescription)"], model: model) }
+        model.objectWillChange.send()
+    }
+
+    static func report(_ problems: [String], model: Model, done: String? = "Purrload will keep running") {
+        guard !problems.isEmpty else { if let done { model.announce(done) }; return }
         let fail = NSAlert()
         fail.messageText = "Couldn't turn it all on"
         fail.informativeText = problems.joined(separator: "\n")
         fail.runModal()
+    }
+
+    static func confirmUninstall(model: Model) {
+        let a = NSAlert()
+        a.messageText = "Uninstall Purrload?"
+        let n = model.activeJobs.count
+        a.informativeText = (n > 0 ? "\(n) download\(n == 1 ? "" : "s") will stop. " : "")
+            + "This stops the engine, removes it from login, deletes Purrload's settings and download list, and moves "
+            + "the app to the Bin. Files you downloaded stay where they are."
+        a.addButton(withTitle: "Uninstall")
+        a.addButton(withTitle: "Cancel")
+        a.alertStyle = .warning
+        NSApp.activate(ignoringOtherApps: true)
+        guard a.runModal() == .alertFirstButtonReturn else { return }
+        model.announce("Uninstalling…")
+        let base = model.base
+        EngineAgent.working = true
+        EngineAgent.stopWithApp()
+        Task.detached {
+            EngineAgent.uninstall(base: base)
+            await MainActor.run {
+                NSWorkspace.shared.recycle([Bundle.main.bundleURL]) { _, _ in NSApp.terminate(nil) }
+            }
+        }
+    }
+}
+
+/// Right-click → Background engine.
+struct EngineMenu: View {
+    @ObservedObject var model: Model
+    var body: some View {
+        Menu("Background engine") {
+            let agent = EngineAgent.isInstalled
+            Button((agent ? "✓ " : "") + "Keep downloading after Purrload quits") {
+                EngineAgentPrompt.setAgent(!agent, model: model)
+            }
+            let login = EngineAgent.opensAtLogin
+            Button((login ? "✓ " : "") + "Open Purrload at login") { EngineAgentPrompt.setOpensAtLogin(!login, model: model) }
+            Divider()
+            Button("Uninstall Purrload…") { EngineAgentPrompt.confirmUninstall(model: model) }
+        }
     }
 }

@@ -472,6 +472,7 @@ struct BarView: View {
                 model.watchClipboard.toggle()
             }
             PitMenu()
+            EngineMenu(model: model)
             if NotchMetrics.find() != nil { Button("Move to notch") { model.switchMode?() } }
             Divider()
             Button("Quit") { NSApp.terminate(nil) }
@@ -509,6 +510,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var awaySince: Double?
     static let openDelay = 0.12, closeDelay = 0.35
 
+    func applicationWillTerminate(_ note: Notification) {
+        EngineAgent.stopWithApp()      // only the engine the app runs itself; launchd's keeps going
+    }
+
     func applicationDidFinishLaunching(_ note: Notification) {
         if !CommandLine.arguments.contains("--stress") { Notifier.shared.start(logTo: model.base) }
         model.writeSettings()      // the engine reads the download folder from here
@@ -522,7 +527,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         build()
         if !CommandLine.arguments.contains("--stress") && !useDemoData {
-            EngineAgent.refreshCopy(base: model.base)
+            EngineAgent.maintain(model: model)
+            Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in   // restart a crashed engine
+                MainActor.assumeIsolated { if let self { EngineAgent.maintain(model: self.model) } }
+            }
             DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in    // after the notch is up
                 MainActor.assumeIsolated { if let self { EngineAgentPrompt.askIfNeeded(model: self.model) } }
             }
@@ -953,16 +961,16 @@ func selftest(to path: String) {
     check("dropped file that isn't a .torrent is rejected", Links.accept("/Users/x/Documents/notes.txt") == nil)
     check("magnet display name comes from dn=", Links.displayName("magnet:?xt=urn:btih:abc&dn=Sintel%204K") == "Sintel 4K")
 
-    // engine agent (launchd): only the plist and the engine copy, never launchctl
-    let copy = try? EngineAgent.copyEngine(base: tmp)
-    check("the app carries the engine and copies it to Application Support",
-          copy.map { FileManager.default.contentsEqual(atPath: $0.path, andPath: EngineAgent.bundledEngine?.path ?? "") } == true)
-    check("the copy includes inspect.py, which the engine runs to read torrents",
-          FileManager.default.fileExists(atPath: EngineAgent.engineCopy(tmp).deletingLastPathComponent().appendingPathComponent("inspect.py").path))
-    if let d = try? EngineAgent.plistData(base: tmp, engine: EngineAgent.engineCopy(tmp)),
+    // engine agent (launchd): only the plist and the app's own files, never launchctl
+    let engine = EngineAgent.bundledEngine
+    check("the engine runs from inside the app", engine?.path.hasPrefix(Bundle.main.bundlePath) == true)
+    check("inspect.py sits next to it (the engine runs it to read torrents)",
+          engine.map { FileManager.default.fileExists(atPath: $0.deletingLastPathComponent().appendingPathComponent("inspect.py").path) } == true)
+    check("the app's signature is intact, so the engine may run", EngineAgent.appIsIntact)
+    if let engine, let d = try? EngineAgent.plistData(base: tmp, engine: engine),
        let p = try? PropertyListSerialization.propertyList(from: d, format: nil) as? [String: Any] {
         check("engine agent starts at login and restarts the engine", p["RunAtLoad"] as? Bool == true && p["KeepAlive"] as? Bool == true)
-        check("engine agent runs the Application Support copy", (p["ProgramArguments"] as? [String])?.last == EngineAgent.engineCopy(tmp).path)
+        check("engine agent runs the engine inside the app", (p["ProgramArguments"] as? [String])?.last == engine.path)
         check("engine agent can find Homebrew's aria2", ((p["EnvironmentVariables"] as? [String: String])?["PATH"] ?? "").contains("/opt/homebrew/bin"))
         check("engine agent keeps crashes in crash.log", (p["StandardErrorPath"] as? String)?.hasSuffix("/crash.log") == true)
     } else { check("engine agent plist builds", false) }
