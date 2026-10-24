@@ -16,15 +16,17 @@ struct Job: Decodable, Identifiable {
     let speed: Double
     let eta: Double?
     let folder: String
+    var message: String? = nil
 
     var fraction: Double { total > 0 ? min(done / total, 1) : 0 }
-    var active: Bool { state == "downloading" || state == "takeover" || state == "failed" }
+    var active: Bool { ["downloading", "takeover", "failed", "starting", "metadata"].contains(state) }
 }
 
 struct Status: Decodable {
     let updated: Double
     let speed: Double
     let paused: Bool
+    var online: Bool? = nil
     let jobs: [Job]
 }
 
@@ -51,6 +53,19 @@ final class Model: ObservableObject {
     @Published var flashTitle: String?           // "S02E10 ready", shown briefly in notch mode
     var flashAt = Date.distantPast
     var lastStates: [String: String] = [:]
+    // drop to download
+    @Published var offer: String?                // a copied download link, offered for ~10s
+    var offerAt = Date.distantPast
+    @Published var dropTarget = false            // a link is being dragged over
+    var clipboardChange = NSPasteboard.general.changeCount   // ignore whatever was copied before launch
+    var watchClipboard: Bool {
+        get { UserDefaults.standard.object(forKey: "watchClipboard") as? Bool ?? true }
+        set { UserDefaults.standard.set(newValue, forKey: "watchClipboard"); objectWillChange.send() }
+    }
+    // kitty moods
+    var caughtAt = Date.distantPast, celebrateAt = Date.distantPast, alertAt = Date.distantPast
+    var slowSince: Date?
+    var lastActive = 0
     var switchMode: (() -> Void)?
     let base: URL = {
         if let custom = ProcessInfo.processInfo.environment["PURRLOAD_HOME"] { return URL(fileURLWithPath: custom) }
@@ -62,21 +77,45 @@ final class Model: ObservableObject {
         if useDemoData { status = demoStatus; return }
         load()
         timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.load() }
+            Task { @MainActor in self?.tick() }
         }
     }
 
     func load() {
         guard let data = try? Data(contentsOf: base.appendingPathComponent("status.json")),
               let s = try? JSONDecoder().decode(Status.self, from: data) else { return }
-        for j in s.jobs {      // a download just passed its check: announce it
-            if let old = lastStates[j.id], old != "verified", j.state == "verified" { announce("\(j.name) ready") }
+        for j in s.jobs {
+            let old = lastStates[j.id]
+            if let old, old != "verified", j.state == "verified" { announce("\(j.name) ready") }   // passed its check
+            if old != "danger", j.state == "danger" { alertAt = Date(); announce("⚠ \(j.name) flagged") }
             lastStates[j.id] = j.state
         }
         status = s
-        if flashTitle != nil && Date().timeIntervalSince(flashAt) > 4 {
+        let now = Date()
+        let active = activeJobs.count
+        if lastActive > 0 && active == 0 && jobs.contains(where: { $0.state == "verified" }) { celebrateAt = now }
+        lastActive = active
+        slowSince = isActive && s.speed < 20_000 ? (slowSince ?? now) : nil
+        if flashTitle != nil && now.timeIntervalSince(flashAt) > 4 {
             withAnimation(.spring(response: 0.38, dampingFraction: 0.82)) { flashTitle = nil }
         }
+    }
+
+    func tick() {
+        load()
+        checkClipboard()
+        if offer != nil && Date().timeIntervalSince(offerAt) > 10 && !expanded { dismissOffer() }
+    }
+
+    /// The strip widens while it has something to say.
+    var wide: Bool { flashTitle != nil || offer != nil || dropTarget }
+
+    var kittyContext: KittyContext {
+        let now = Date()
+        return KittyContext(expanded: expanded, toggledAt: toggledAt, pettedAt: pettedAt, active: isActive,
+                            fast: isActive && (status?.speed ?? 0) >= 3 * 1_048_576,
+                            worried: isActive && (status?.online == false || now.timeIntervalSince(slowSince ?? now) > 20),
+                            dropTarget: dropTarget, caughtAt: caughtAt, celebrateAt: celebrateAt, alertAt: alertAt)
     }
 
     func announce(_ title: String) {
@@ -219,16 +258,20 @@ struct Row: View {
     var lineColor: Color {
         switch job.state {
         case "verified": return .mint
-        case "corrupt", "expired": return .gem
+        case "corrupt", "expired", "danger": return .gem
         default: return .lilac
         }
     }
 
     var caption: String {
         switch job.state {
-        case "verified": return "Ready to watch · \(gb(job.total)) · checked ✓"
+        case "verified": return "Ready · \(gb(job.total)) · checked ✓"
         case "corrupt":  return "Failed the check, needs re-downloading"
         case "expired":  return "Link expired, get a fresh one from the site"
+        case "starting": return "Getting file info…"
+        case "metadata": return "Asking peers for the file list…"
+        case "skipped":  return job.message ?? "Skipped"
+        case "danger":   return "⚠ " + (job.message ?? "Flagged by the safety check: don't open it")
         default:
             return "\(gb(job.done)) of \(gb(job.total)) · \(mbs(job.speed)) · \(left(job.eta))"
         }
@@ -252,6 +295,9 @@ struct BarView: View {
     }
 
     var headline: String {
+        if model.dropTarget { return "Drop to download ↓" }
+        if let f = model.flashTitle { return f }
+        if model.offer != nil && !open { return "Copied a download link · click" }
         if !model.guardRunning { return "Engine isn't running" }
         if model.status?.paused == true { return "Paused" }
         let n = model.activeJobs.count
@@ -279,6 +325,7 @@ struct BarView: View {
 
             if open {
                 VStack(alignment: .leading, spacing: 13) {
+                    OfferRow(model: model)
                     if !model.series.isEmpty {
                         Text(model.series).font(.system(size: 10.5, weight: .semibold)).foregroundStyle(Color.soft)
                             .textCase(.uppercase).tracking(0.6).padding(.bottom, -5)
@@ -304,9 +351,13 @@ struct BarView: View {
         .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
         .contentShape(Rectangle())
         .onTapGesture { withAnimation(.spring(response: 0.36, dampingFraction: 0.84)) { model.toggle() } }
+        .modifier(LinkDropTarget(model: model, enabled: measuring == nil && kittyAt == nil))
         .contextMenu {
             Button(model.status?.paused == true ? "Resume downloads" : "Pause downloads") { model.togglePause() }
             Button("Open folder") { model.openFolder() }
+            Button(model.watchClipboard ? "✓ Offer copied download links" : "Offer copied download links") {
+                model.watchClipboard.toggle()
+            }
             if NotchMetrics.find() != nil { Button("Move to notch") { model.switchMode?() } }
             Divider()
             Button("Quit") { NSApp.terminate(nil) }
@@ -471,7 +522,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let w = p.frame.width, h = p.frame.height
         let fit = model.expanded ? openFit : closedFit
         if let m = notch {
-            let sw = m.width(open: model.expanded, flashing: model.flashTitle != nil)
+            let sw = m.width(open: model.expanded, flashing: model.wide)
             let shape = CGRect(x: (w - sw) / 2, y: h - fit.height, width: sw, height: fit.height)
             let ks = NotchMetrics.kittySize    // the kitty sits inside the right wing
             let kitty = CGRect(x: shape.maxX - NotchMetrics.shoulder - 4 - ks.width, y: h - m.height, width: ks.width, height: m.height)
@@ -662,33 +713,45 @@ func snapshotNotch(to path: String) {
                     .fill(.black).frame(width: m.notchWidth, height: m.height)
                 NotchView(model: x, metrics: m, kittyAt: now, measuring: open)
             }
-            .frame(width: 560, height: open ? 420 : 70)
+            .frame(width: 560, height: open ? 470 : 70)
             .clipped()
             Text(label).font(.system(size: 12, weight: .semibold)).foregroundStyle(.white)
         }
     }
-    let poses: [(String, Model)] = [("idle", model(expanded: false, toggled: 99)), ("nap", model(expanded: false, toggled: 99)),
-                                    ("yawn", model(expanded: false, toggled: 0.65)), ("petted", model(expanded: false, petted: 0.5))]
+    let ago = { (s: Double) in now.addingTimeInterval(-s) }
+    let moods: [(String, KittyContext)] = [
+        ("idle", KittyContext(active: true)), ("fast", KittyContext(active: true, fast: true)),
+        ("worried", KittyContext(active: true, worried: true)), ("flagged", KittyContext(alertAt: ago(1))),
+        ("all done", KittyContext(celebrateAt: ago(0.9))), ("caught a link", KittyContext(caughtAt: ago(0.45))),
+        ("drop here", KittyContext(dropTarget: true)), ("nap", KittyContext(toggledAt: ago(99))),
+    ]
+    let dropModel = model(expanded: false); dropModel.dropTarget = true
+    let offerModel = model(expanded: false); offerModel.offer = "magnet:?xt=urn:btih:abc&dn=Cosmos%20Laundromat"
+    let alertModel = model(expanded: false, flash: "⚠ Sample flagged")
+    let addedModel = model(expanded: false, flash: "Added Sintel.4K.mkv")
     let view = VStack(alignment: .leading, spacing: 20) {
         HStack(alignment: .top, spacing: 20) {
             VStack(spacing: 20) {
                 scene("closed", model(expanded: false), open: false)
                 scene("download finished", model(expanded: false, flash: "Sintel 4K ready"), open: false)
-                HStack(spacing: 10) {
-                    ForEach(poses, id: \.0) { name, x in
+                scene("dragging a link over it", dropModel, open: false)
+                scene("copied a download link", offerModel, open: false)
+                scene("link added", addedModel, open: false)
+                scene("safety check flagged a torrent", alertModel, open: false)
+                HStack(spacing: 6) {
+                    ForEach(moods, id: \.0) { name, mood in
                         VStack(spacing: 2) {
-                            ZStack {
-                                Color.black
-                                KittyView(model: x, frozenAt: now).scaleEffect(NotchMetrics.kittyScale)
-                                    .frame(width: NotchMetrics.kittySize.width, height: NotchMetrics.kittySize.height)
-                            }
-                            .frame(width: 56, height: 36).scaleEffect(2.2).frame(width: 125, height: 84)
-                            Text(name).font(.system(size: 11, weight: .semibold)).foregroundStyle(.white)
+                            KittyView(model: model(expanded: false), frozenAt: now, mood: mood)
+                                .frame(width: 76, height: 72).background(Color.black).scaleEffect(0.86).frame(width: 66, height: 64)
+                            Text(name).font(.system(size: 10, weight: .semibold)).foregroundStyle(.white)
                         }
                     }
                 }
             }
-            scene("open", model(expanded: true, toggled: 1.3), open: true)
+            VStack(spacing: 20) {
+                scene("open", model(expanded: true, toggled: 1.3), open: true)
+                scene("open, with a copied link", { let x = model(expanded: true, toggled: 9); x.offer = "https://example.com/films/Cosmos.Laundromat.mkv"; return x }(), open: true)
+            }
         }
     }
     .padding(20).background(Color(white: 0.35))
@@ -700,11 +763,62 @@ func snapshotNotch(to path: String) {
     try? png.write(to: URL(fileURLWithPath: path))
 }
 
+/// Purrload --selftest out.log : logic checks for drop-to-download (link rules, inbox writing).
+@MainActor
+func selftest(to path: String) {
+    var lines: [String] = [], pass = 0, total = 0
+    func check(_ label: String, _ ok: Bool) { total += 1; pass += ok ? 1 : 0; lines.append("\(ok ? "ok   " : "WRONG") \(label)") }
+    let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("purrload-selftest-\(UUID().uuidString)")
+    try? FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+    let tor = tmp.appendingPathComponent("show.torrent").path
+    FileManager.default.createFile(atPath: tor, contents: Data("d4:infod4:name1:aee".utf8))
+
+    check("copied magnet is offered", Links.find(in: "magnet:?xt=urn:btih:abc&dn=Sintel") != nil)
+    check("copied link to a .mkv is offered", Links.find(in: "https://example.com/films/Sintel.4K.mkv") != nil)
+    check("copied link to a .dmg with a query string is offered", Links.find(in: "https://cdn.example.com/App-2.1.dmg?sig=x") != nil)
+    check("copied signed attachment link is offered",
+          Links.find(in: "https://r2.example.com/hub/abc?response-content-disposition=attachment%3B%20filename%3D%22a.mkv%22") != nil)
+    check("copied ordinary page link is NOT offered", Links.find(in: "https://www.google.com/search?q=cats") == nil)
+    check("copied sentence with a link is NOT offered", Links.find(in: "look at https://x.com/a.mkv please") == nil)
+    check("copied existing .torrent path is offered", Links.find(in: tor) != nil)
+    check("copied missing .torrent path is NOT offered", Links.find(in: "/nope/missing.torrent") == nil)
+    check("dropped ordinary page link IS accepted", Links.accept("https://example.com/page") != nil)
+    check("dropped plain text is rejected", Links.accept("hello there") == nil)
+    check("dropped file that isn't a .torrent is rejected", Links.accept("/Users/x/Documents/notes.txt") == nil)
+    check("magnet display name comes from dn=", Links.displayName("magnet:?xt=urn:btih:abc&dn=Sintel%204K") == "Sintel 4K")
+
+    setenv("PURRLOAD_HOME", tmp.path, 1)
+    let m = Model()
+    m.enqueue("https://example.com/films/Sintel.4K.mkv")
+    let inbox = tmp.appendingPathComponent("inbox")
+    let files = (try? FileManager.default.contentsOfDirectory(atPath: inbox.path)) ?? []
+    check("enqueue writes exactly one inbox file", files.count == 1)
+    if let f = files.first, let d = try? Data(contentsOf: inbox.appendingPathComponent(f)),
+       let obj = try? JSONSerialization.jsonObject(with: d) as? [String: String] {
+        check("inbox file holds the link", obj["url"] == "https://example.com/films/Sintel.4K.mkv")
+    } else { check("inbox file holds the link", false) }
+    check("no half-written temp files left behind",
+          ((try? FileManager.default.contentsOfDirectory(atPath: tmp.path)) ?? []).allSatisfy { !$0.hasPrefix(".inbox-") })
+    check("kitty catches the link", Date().timeIntervalSince(m.caughtAt) < 1)
+    m.offer = "magnet:?xt=urn:btih:abc"; m.offerAt = Date()
+    check("offer widens the strip", m.wide)
+    m.acceptOffer()
+    check("accepting the offer queues it and clears it", m.offer == nil &&
+          (((try? FileManager.default.contentsOfDirectory(atPath: inbox.path)) ?? []).count == 2))
+    try? FileManager.default.removeItem(at: tmp)
+    lines += ["", "TOTAL \(pass)/\(total)"]
+    try? lines.joined(separator: "\n").write(toFile: path, atomically: true, encoding: .utf8)
+}
+
 @main
 struct PurrloadApp {
     static func main() {
         // Purrload --snapshot out.png : render the expanded bar (light + dark) to an image for checking the design
         useDemoData = CommandLine.arguments.contains("--demo")
+        if let i = CommandLine.arguments.firstIndex(of: "--selftest"), i + 1 < CommandLine.arguments.count {
+            MainActor.assumeIsolated { selftest(to: CommandLine.arguments[i + 1]) }
+            return
+        }
         if let i = CommandLine.arguments.firstIndex(of: "--snapshot-notch"), i + 1 < CommandLine.arguments.count {
             MainActor.assumeIsolated { snapshotNotch(to: CommandLine.arguments[i + 1]) }
             return

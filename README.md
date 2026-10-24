@@ -14,6 +14,17 @@ Purrload keeps your Safari downloads alive. It stops your Mac from sleeping mid-
 - When a download finishes and passes its check, the strip briefly widens to say so.
 - No notch, or using an external display? It becomes a floating bar in the corner instead (right-click to switch).
 
+**Drop to download**
+- Drag a link, magnet link or `.torrent` file onto the notch: the strip opens wide to say "Drop to download", and the kitty gets ready to catch it.
+- Copy a download link (a magnet, or a web link to a `.mkv`, `.zip`, `.dmg`, …) and the notch offers to download it. Ordinary page links are ignored. You can turn this off with a right-click.
+- Web downloads go to `~/Downloads` (8 connections per file with aria2, otherwise curl), with the same resume, retry and network-switch recovery.
+- Torrents automatically follow the safe path: fetch the file list, download only video, audio and subtitles, check the contents, and add the quarantine mark.
+
+**A kitty with moods**
+- It hops and sparkles when downloads are fast, and looks worried (with a sweat drop) when they stall or the network drops.
+- It puffs up with a red "!" when the safety check flags a torrent.
+- It throws confetti when everything is finished, and naps when there's nothing to do. Click it to pet it.
+
 **Keeps downloads alive**
 - Keeps the Mac awake while anything is downloading.
 - Watches each file's real size on disk, so a download that has silently stopped growing gets caught.
@@ -73,8 +84,8 @@ The install script:
 
 Purrload has two halves that talk through a single status file:
 
-- **The engine** (`engine/purrload-engine.py`) watches Safari's download list and each file on disk. It keeps the Mac awake, takes over failed or stalled downloads with `curl`, and checks finished files. Every second, it writes the current state to `status.json`.
-- **The app** (`app/`, SwiftUI) reads `status.json` and draws the notch or bar, plus the kitty. The app never downloads anything itself, so quitting it doesn't stop your downloads.
+- **The engine** (`engine/purrload-engine.py`) watches Safari's download list and each file on disk. It keeps the Mac awake, takes over failed or stalled downloads with `curl`, and checks finished files. It also runs downloads the app queues in its `inbox/` folder. It keeps the current state in `status.json`.
+- **The app** (`app/`, SwiftUI) reads `status.json` and draws the notch or bar, plus the kitty. When you drop or accept a link, the app writes a small request file into the engine's `inbox/` folder. The app never downloads anything itself, so quitting it doesn't stop your downloads.
 
 Runtime data lives in `~/Library/Application Support/Purrload` (set `PURRLOAD_HOME` to change it). Nothing is ever sent anywhere: Purrload has no telemetry, no analytics and no network access of its own apart from the downloads you start. Download links can contain access tokens, so they are never written to logs.
 
@@ -85,6 +96,7 @@ scripts/build.sh                 # build ./build/Purrload.app
 scripts/build.sh --install       # build, copy to ~/Applications, relaunch
 build/Purrload.app/Contents/MacOS/Purrload --demo --snapshot-notch out.png   # render the notch to an image
 build/Purrload.app/Contents/MacOS/Purrload --stress out.log --mode notch     # open/close stress test
+build/Purrload.app/Contents/MacOS/Purrload --selftest out.log                # link detection + inbox checks
 ```
 
 The stress test opens and closes the notch or bar 60 times like real clicks, at speeds up to one toggle every 50 ms. It reports:
@@ -96,7 +108,8 @@ The stress test opens and closes the notch or bar 60 times like real clicks, at 
 ## Roadmap
 
 - Safari extension: "Download with Purrload" in the right-click menu (needs Xcode)
-- Handle `magnet:` links and `.torrent` files directly from the app
+- Register as the handler for `magnet:` links and `.torrent` files, so clicking them in Safari opens Purrload
+- Per-download pause, cancel and "show in Finder"
 - Swift download engine built on aria2's remote-control (JSON-RPC) interface, replacing the Python engine
 - Settings window: download folder, connections, speed limit, auto-pause on mobile hotspot data
 - Signed and notarized releases, Homebrew cask, automatic updates

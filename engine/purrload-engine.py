@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Purrload engine: watches in-progress Safari downloads and keeps them alive.
+"""Purrload engine: keeps downloads alive.
 
+- Watches in-progress Safari downloads, and runs downloads dropped on the app (web links, magnets, .torrent files).
 - Keeps the Mac awake (caffeinate) while any download is active.
 - Tracks real on-disk progress, speed, ETA and signed-URL expiry.
 - On failure, or a stall with Safari no longer writing, takes the partial file
   over and resumes it with curl range requests (same byte offset, same URL).
 - Verifies finished files (exact size + Matroska/MP4 header) and notifies.
 """
-import os, re, sys, time, json, plistlib, subprocess, shutil
+import os, re, sys, time, json, plistlib, subprocess, shutil, threading, uuid, tempfile, fcntl, termios, struct
 from collections import deque
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse, parse_qs
@@ -20,12 +21,19 @@ os.makedirs(BASE, exist_ok=True)
 LOG = f"{BASE}/engine.log"
 STATUS = f"{BASE}/status.txt"
 STATUS_JSON = f"{BASE}/status.json"  # read by the Purrload app
-TICK = 10
+TICK = 2
 STALL_SECS = 300        # no growth this long -> stalled
 TAKEOVER_SECS = 300     # stalled AND Safari hasn't touched file this long -> curl takeover
 EXPIRY_WARN = 1800      # warn when ETA lands within 30 min of link expiry
 CURL_HANG_SECS = 60     # curl alive but no bytes this long -> restart it
 PAUSE = f"{BASE}/PAUSE" # touch to pause all curl downloads, delete to resume
+INBOX = f"{BASE}/inbox" # the app drops {"url": ...} files here to start a download
+DOWNLOADS = os.environ.get("PURRLOAD_DOWNLOADS", f"{HOME}/Downloads")
+INSPECT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "inspect.py")
+ARIA2 = None if os.environ.get("PURRLOAD_NO_ARIA2") else (shutil.which("aria2c") or
+        next((p for p in ("/opt/homebrew/bin/aria2c", "/usr/local/bin/aria2c") if os.path.exists(p)), None))
+DIRECT_HANG_SECS = 90   # dropped download alive but no bytes this long -> restart it
+VIDEO_EXTS = (".mkv", ".webm", ".mp4", ".m4v", ".mov")
 
 def log(msg):
     line = f"{datetime.now():%Y-%m-%d %H:%M:%S}  {msg}"
@@ -111,6 +119,213 @@ class Job:
             return 0
         (t0, s0), (t1, s1) = self.hist[0], self.hist[-1]
         return (s1 - s0) / (t1 - t0) if t1 > t0 else 0
+
+
+def quarantine(path):
+    """Mark a file as downloaded so Gatekeeper checks it on first open (curl/aria2 don't do this)."""
+    subprocess.run(["xattr", "-w", "com.apple.quarantine", f"0081;{int(time.time()):08x};Purrload;", path],
+                   capture_output=True)
+
+def probe(url):
+    """(filename, size) for a web link, from its headers, falling back to the URL itself."""
+    r = subprocess.run(["curl", "-sSIL", "--max-time", "20", url], capture_output=True, text=True, errors="replace")
+    name, size = None, 0
+    for line in r.stdout.splitlines():                     # last response wins (after redirects)
+        k, _, v = line.partition(":")
+        k = k.strip().lower()
+        if k == "content-length" and v.strip().isdigit():
+            size = int(v.strip())
+        elif k == "content-disposition":
+            m = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)"?', v, re.I)
+            if m: name = m.group(1).strip()
+    if not name:
+        q = parse_qs(urlparse(url).query).get("response-content-disposition", [""])[0]
+        m = re.search(r'filename="?([^";]+)"?', q)
+        name = m.group(1) if m else os.path.basename(urlparse(url).path) or "download"
+    return re.sub(r'[/\\:]', "_", name)[:200], size
+
+def unique_path(folder, name):
+    base, ext = os.path.splitext(name)
+    path, n = os.path.join(folder, name), 1
+    while os.path.exists(path) or os.path.exists(path + ".part"):
+        path, n = os.path.join(folder, f"{base} ({n}){ext}"), n + 1
+    return path
+
+UNIT = {"B": 1, "KiB": 1024, "MiB": 1024 ** 2, "GiB": 1024 ** 3, "TiB": 1024 ** 4}
+READOUT = re.compile(r"\[#\w+ (?:SEED\([^)]*\) )?([\d.]+)(B|KiB|MiB|GiB|TiB)/([\d.]+)(B|KiB|MiB|GiB|TiB)")
+READOUT_DL = re.compile(r"DL:([\d.]+)(B|KiB|MiB|GiB|TiB)")
+
+class Runner:
+    """A download subprocess. For aria2 it parses the live readout ([#id 1.2GiB/2.5GiB(48%) ...]),
+    because multi-connection and torrent downloads write out of order, so file size isn't progress.
+    aria2 only prints that readout to a terminal (trimmed to its width), so it gets a 200-column pseudo-terminal."""
+    def __init__(self, args, parse):
+        self.done = self.total = self.speed = 0
+        self.parsed = parse
+        if not parse:
+            self.proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return
+        self.master, slave = os.openpty()
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 200, 0, 0))
+        self.proc = subprocess.Popen(args + ["--enable-color=false"], stdin=subprocess.DEVNULL, stdout=slave, stderr=slave)
+        os.close(slave)
+        threading.Thread(target=self._read, daemon=True).start()
+
+    def _read(self):
+        buf = b""
+        while True:
+            try:
+                chunk = os.read(self.master, 4096)
+            except OSError:          # EIO once aria2 exits and the terminal closes
+                chunk = b""
+            if not chunk:
+                os.close(self.master)
+                return
+            buf += chunk
+            *lines, buf = re.split(rb"[\r\n]", buf)
+            for line in lines:
+                text = line.decode("utf-8", "replace")
+                m = READOUT.search(text)
+                if m:
+                    self.done = float(m.group(1)) * UNIT[m.group(2)]
+                    self.total = float(m.group(3)) * UNIT[m.group(4)]
+                    d = READOUT_DL.search(text)    # aria2's own speed: the sizes above are rounded to 0.1 GiB
+                    self.speed = float(d.group(1)) * UNIT[d.group(2)] if d else 0
+
+    def alive(self):
+        return self.proc.poll() is None
+
+    def stop(self):
+        if self.alive():
+            self.proc.terminate()
+            try: self.proc.wait(10)
+            except subprocess.TimeoutExpired: self.proc.kill()
+
+class DirectJob:
+    """A download Purrload runs itself (dropped/accepted in the app). One worker thread per job."""
+    def __init__(self, url):
+        self.id = str(uuid.uuid4())
+        self.url = url
+        self.torrent = url.startswith("magnet:") or url.lower().endswith(".torrent")
+        self.folder = os.path.join(DOWNLOADS, "Torrents") if self.torrent else DOWNLOADS
+        self.name = self.title = "Magnet link" if url.startswith("magnet:") else (
+            os.path.basename(url) if self.torrent else os.path.basename(urlparse(url).path) or "download")
+        self.state = "starting"          # starting -> metadata (magnets) -> downloading -> verified | corrupt | danger
+        self.message = ""
+        self.total = 0
+        self.run = None                  # current Runner
+        self.part = None                 # http: the .part file being written
+        self.hist = deque(maxlen=12)
+        self.last_growth = time.time()
+        threading.Thread(target=self.work, daemon=True).start()
+
+    # ----- progress, read by the main loop -----
+    def done_bytes(self):
+        if self.state == "verified":
+            return self.total
+        if self.run and ARIA2 and (self.torrent or self.run.total):
+            return self.run.done
+        return os.path.getsize(self.part) if self.part and os.path.exists(self.part) else 0
+
+    def speed(self):
+        if self.run and self.run.parsed and self.run.alive():
+            return self.run.speed
+        if len(self.hist) < 2:
+            return 0
+        (t0, s0), (t1, s1) = self.hist[0], self.hist[-1]
+        return max(0, (s1 - s0) / (t1 - t0)) if t1 > t0 else 0
+
+    def set_name(self, name):
+        self.title = pretty(name)
+        self.name = short(name) if re.search(r"S\d+E\d+", name) else self.title[:40]
+
+    # ----- worker thread -----
+    def work(self):
+        try:
+            os.makedirs(self.folder, exist_ok=True)
+            self.work_torrent() if self.torrent else self.work_http()
+        except Exception as e:
+            self.fail(f"error: {e}")
+
+    def fail(self, msg, state="corrupt"):
+        self.state, self.message = state, msg
+        log(f"{self.name}: {msg}")
+        notify("Purrload", f"{self.name}: {msg}")
+
+    def attempts(self, make_args, parse, complete, tries=10):
+        """Run the download command, restarting it (it resumes) until complete() or out of tries."""
+        for _ in range(tries):
+            while os.path.exists(PAUSE):
+                time.sleep(2)
+            self.run = Runner(make_args(), parse)
+            self.run.proc.wait()
+            if complete():
+                return True
+            time.sleep(3)
+        return False
+
+    def work_http(self):
+        name, self.total = probe(self.url)
+        self.set_name(name)
+        final = unique_path(self.folder, name)
+        self.part = final + ".part"
+        self.state = "downloading"
+        log(f"{self.name}: downloading to {self.folder} ({fmt_bytes(self.total) if self.total else 'size unknown'})")
+        if ARIA2:
+            make = lambda: [ARIA2, self.url, "-d", self.folder, "-o", os.path.basename(self.part), "-c",
+                            "-x8", "-s8", "-k1M", "--file-allocation=none", "--auto-file-renaming=false",
+                            "--allow-overwrite=true", "--console-log-level=error", "--summary-interval=0",
+                            "--max-tries=5", "--retry-wait=3"]
+        else:
+            make = lambda: ["curl", "-sS", "-L", "-C", "-", "--retry", "5", "--retry-all-errors", "-o", self.part, self.url]
+        def complete():
+            if not os.path.exists(self.part) or os.path.exists(self.part + ".aria2"):
+                return False
+            return self.run.proc.returncode == 0 and (not self.total or os.path.getsize(self.part) == self.total)
+        if not self.attempts(make, bool(ARIA2), complete):
+            return self.fail("download kept failing; drop the link again to retry")
+        size = os.path.getsize(self.part)
+        if final.lower().endswith(VIDEO_EXTS) and not media_ok(self.part):
+            return self.fail("finished, but it isn't a valid video file")
+        quarantine(self.part)
+        os.rename(self.part, final)
+        self.part, self.total, self.state = None, size, "verified"
+        self.message = os.path.basename(final)
+        notify("Download complete", f"{self.name} ({fmt_bytes(size)})")
+
+    def work_torrent(self):
+        if not ARIA2:
+            return self.fail("torrents need aria2: brew install aria2")
+        work = tempfile.mkdtemp(prefix="purrload-")
+        tor = self.url
+        if self.url.startswith("magnet:"):
+            self.state = "metadata"
+            self.run = Runner([ARIA2, "-d", work, "--bt-metadata-only=true", "--bt-save-metadata=true",
+                               "--bt-stop-timeout=120", "--console-log-level=error", "--summary-interval=0", self.url], False)
+            self.run.proc.wait()
+            found = [f for f in os.listdir(work) if f.endswith(".torrent")]
+            if not found:
+                return self.fail("no peers sent the file list; try again later")
+            tor = os.path.join(work, found[0])
+        plan = subprocess.run([sys.executable, "-I", INSPECT, "plan", tor, "0"], capture_output=True, text=True)
+        if plan.returncode != 0:
+            return self.fail("skipped: no video, audio or subtitles in it", "skipped")
+        name, sel, size = plan.stdout.strip().split("\n")[-3:]
+        self.set_name(name)
+        self.total = int(size)
+        self.state = "downloading"
+        log(f"{self.name}: torrent, fetching media files {sel}")
+        make = lambda: [ARIA2, "-d", self.folder, "-T", tor, f"--select-file={sel}", "--bt-remove-unselected-file=true",
+                        "-c", "--file-allocation=none", "--seed-time=0", "--max-tries=0", "--retry-wait=5",
+                        "--console-log-level=error", "--summary-interval=0"]
+        if not self.attempts(make, True, lambda: self.run.proc.returncode == 0):
+            return self.fail("torrent download kept failing")
+        check = subprocess.run([sys.executable, "-I", INSPECT, "check", os.path.join(self.folder, name)],
+                               capture_output=True, text=True)
+        if check.returncode == 1:
+            return self.fail("the safety check flagged files in it: don't open them", "danger")
+        self.state, self.message = "verified", name
+        notify("Download complete", f"{self.name}: checked, only media inside")
 
 class Engine:
     def __init__(self):
@@ -202,7 +417,7 @@ class Engine:
             notify("Purrload", f"{j.name}: size mismatch {size} vs {j.total}, needs re-download")
             j.state = "corrupt"
             return
-        if not media_ok(path):
+        if path.lower().endswith(VIDEO_EXTS) and not media_ok(path):
             notify("Purrload", f"{j.name}: finished but header isn't a valid video container")
             j.state = "corrupt"
             return
@@ -275,7 +490,7 @@ class Engine:
                 j.warned.add("expiry")
 
     def active(self):
-        return [j for j in self.jobs.values() if j.state in ("downloading", "failed", "takeover")]
+        return [j for j in self.jobs.values() if j.state in ("downloading", "failed", "takeover", "starting", "metadata")]
 
     def keep_awake(self):
         if self.active() and (self.caff is None or self.caff.poll() is not None):
@@ -289,6 +504,15 @@ class Engine:
         rows = [f"Purrload  ·  {datetime.now():%H:%M:%S}", ""]
         tot_sp, items = 0, []
         for j in self.jobs.values():
+            if isinstance(j, DirectJob):
+                size, sp = j.done_bytes(), j.speed() if j.state == "downloading" else 0
+                tot_sp += sp
+                items.append({"id": j.id, "name": j.name, "title": j.title, "state": j.state, "done": size,
+                              "total": j.total, "speed": sp, "eta": (j.total - size) / sp if sp > 0 and j.total else None,
+                              "folder": j.folder, "message": j.message})
+                rows.append(f"{j.name[:8]:8} {j.state:11} {100 * size / j.total if j.total else 0:5.1f}%  "
+                            f"{fmt_bytes(size):>9} / {fmt_bytes(j.total):<9} {sp / 1048576:5.2f} MB/s")
+                continue
             size = j.size() or (os.path.getsize(j.final) if os.path.exists(j.final) else 0)
             sp = j.speed() if j.state in ("downloading", "takeover") else 0
             tot_sp += sp
@@ -305,12 +529,50 @@ class Engine:
             f.write("\n".join(rows) + "\n")
         tmp = STATUS_JSON + ".tmp"   # write-then-rename so the bar never reads half a file
         with open(tmp, "w") as f:
-            json.dump({"updated": time.time(), "speed": tot_sp, "paused": self.paused, "jobs": items}, f)
+            json.dump({"updated": time.time(), "speed": tot_sp, "paused": self.paused,
+                       "online": self.gateway is not None, "jobs": items}, f)
         os.replace(tmp, STATUS_JSON)
 
+    def take_inbox(self):
+        """Start downloads the app has queued."""
+        try:
+            names = sorted(os.listdir(INBOX))
+        except FileNotFoundError:
+            return False
+        for n in names:
+            p = os.path.join(INBOX, n)
+            try:
+                url = json.load(open(p))["url"].strip()
+            except Exception:
+                url = None
+            os.remove(p)
+            if url and re.match(r"(https?://|magnet:\?)", url) or (url and url.lower().endswith(".torrent") and os.path.exists(url)):
+                j = DirectJob(url)
+                self.jobs[j.id] = j
+                log(f"added a {'torrent' if j.torrent else 'web'} download from the app")
+            elif url:
+                log("ignored an inbox item that isn't a web link, magnet or .torrent file")
+        return bool(names)
+
+    def step_direct(self, j, now):
+        if j.state not in ("downloading", "metadata"):
+            return
+        size = j.done_bytes()
+        if not j.hist or size > j.hist[-1][1] or (j.run and j.run.parsed and j.run.speed > 0):
+            j.last_growth = now
+        j.hist.append((now, size))
+        if self.paused and j.run:
+            j.run.stop()              # the worker waits for PAUSE to go away, then resumes
+        elif j.state == "downloading" and j.run and j.run.alive() and now - j.last_growth > DIRECT_HANG_SECS:
+            log(f"{j.name}: no bytes for {DIRECT_HANG_SECS}s, restarting")
+            j.last_growth = now
+            j.run.stop()
+
     def run(self):
-        log(f"engine started (pid {os.getpid()})")
+        log(f"engine started (pid {os.getpid()}, aria2 {'found' if ARIA2 else 'not found'})")
+        os.makedirs(INBOX, exist_ok=True)
         while True:
+            self.take_inbox()
             entries = self.read_plist()
             if entries is not None:
                 self.sync_entries(entries)
@@ -324,16 +586,21 @@ class Engine:
                 log(f"network changed: gateway {self.gateway} -> {gw}")
                 self.gateway = gw
                 for j in self.jobs.values():
-                    if j.state == "takeover":
+                    if isinstance(j, DirectJob):
+                        if j.run: j.run.stop()      # its worker restarts it on the new network
+                    elif j.state == "takeover":
                         self.stop_curl(j, "network changed")
             for j in list(self.jobs.values()):
                 try:
-                    self.step(j, now)
+                    self.step_direct(j, now) if isinstance(j, DirectJob) else self.step(j, now)
                 except Exception as e:
                     log(f"{j.name}: error {e!r}")
             self.keep_awake()
             self.write_status()
-            time.sleep(TICK if self.active() else 30)
+            for _ in range(TICK if self.active() else 10):   # check the inbox every second
+                time.sleep(1)
+                if os.listdir(INBOX):
+                    break
 
 if __name__ == "__main__":
     # a previous engine's curls may still be writing our .part files: stop them first

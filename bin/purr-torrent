@@ -30,7 +30,7 @@ else
 fi
 
 PLAN=$(python3 -I "$ENGINE/inspect.py" plan "$TOR" "$ALL") || exit 1
-NAME=${PLAN%%$'\n'*}; SEL=${PLAN#*$'\n'}
+NAME=${PLAN%%$'\n'*}; SEL=${${PLAN#*$'\n'}%%$'\n'*}
 read -r "?Download the files marked 'get' to $DEST? [y/N] " ok
 [[ "$ok" == [yY]* ]] || exit 0
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Torrent safety checks.
 
-  inspect.py plan  <file.torrent> [all]  -> stdout line 1: torrent name, line 2: aria2 --select-file list
+  inspect.py plan  <file.torrent> [all]  -> stdout: torrent name, aria2 --select-file list, selected bytes
   inspect.py check <path>                -> quarantine every file, report anything that isn't plain media
 
 Only reads file bytes; never opens or runs anything it inspects.
@@ -83,7 +83,7 @@ def plan(torrent, take_all):
     else:
         files = [(name, info[b"length"])]
 
-    sel, red = [], 0
+    sel, red, sel_bytes = [], 0, 0
     out = sys.stderr
     print(f"\nTorrent: {name}   ({len(files)} files, {human(sum(s for _, s in files))})\n", file=out)
     for idx, (path, size) in enumerate(files, 1):
@@ -96,7 +96,7 @@ def plan(torrent, take_all):
         red += is_red
         take = take_all == "2" or (wanted and not is_red) or (take_all == "1" and not is_red)
         if take:
-            sel.append(str(idx))
+            sel.append(str(idx)); sel_bytes += size
         mark = "  get " if take else " skip "
         print(f"{mark} {human(size):>9}  {path}", file=out)
         for lvl, msg in flags:
@@ -111,6 +111,7 @@ def plan(torrent, take_all):
         sys.exit(2)
     print(name)
     print(",".join(sel))
+    print(sel_bytes)
 
 # ---------- check: inspect what actually arrived ----------
 

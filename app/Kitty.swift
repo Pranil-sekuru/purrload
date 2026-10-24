@@ -19,13 +19,34 @@ struct Pose {
     var tailAmp: CGFloat = 1
     var hearts: Double? = nil      // 0...1 progress
     var sleeping = false
+    // moods
+    var worried = false            // brows up, ears flat
+    var sweat = false
+    var alert = false              // red "!" and a puffed tail
+    var sparkle = false            // fast downloads
+    var confetti: Double? = nil    // 0...1, everything finished
 }
 
-func pose(at now: Date, expanded: Bool, toggledAt: Date, pettedAt: Date, active: Bool) -> Pose {
+/// What's going on, as far as the kitty cares.
+struct KittyContext {
+    var expanded = false
+    var toggledAt = Date.distantPast
+    var pettedAt = Date.distantPast
+    var active = false
+    var fast = false               // downloading quickly
+    var worried = false            // stalled, or the network is down
+    var dropTarget = false         // a link is being dragged over
+    var caughtAt = Date.distantPast      // a link was dropped/accepted
+    var celebrateAt = Date.distantPast   // everything finished
+    var alertAt = Date.distantPast       // a download was flagged
+}
+
+func pose(at now: Date, _ x: KittyContext) -> Pose {
     var p = Pose()
     let t = now.timeIntervalSinceReferenceDate
-    let tt = now.timeIntervalSince(toggledAt)
-    let tp = now.timeIntervalSince(pettedAt)
+    let tt = now.timeIntervalSince(x.toggledAt)
+    let tp = now.timeIntervalSince(x.pettedAt)
+    let expanded = x.expanded, active = x.active
     p.tailSpeed = active ? 2.6 : 1.4
 
     if expanded && tt < 0.75 {                       // crouch, then jump
@@ -43,6 +64,32 @@ func pose(at now: Date, expanded: Bool, toggledAt: Date, pettedAt: Date, active:
     } else if !expanded && !active {                 // nap
         p.sleeping = true; p.eyes = .closed; p.headDrop = 2.5; p.squash = 0.94
         p.tailAmp = 0.25; p.tailSpeed = 0.6
+    }
+
+    // moods
+    if x.worried && !p.sleeping {
+        p.worried = true; p.sweat = true; p.earPerk = -3.5; p.tailAmp = 0.35; p.tailSpeed = 1
+    } else if x.fast {                               // little hops and sparkles
+        let k = t.truncatingRemainder(dividingBy: 1.6)
+        if k < 0.45 { p.lift = max(p.lift, 7 * CGFloat(sin(k / 0.45 * .pi))); p.eyes = .happy }
+        p.sparkle = true; p.tailSpeed = 3.4
+    }
+    if x.dropTarget {                                // ready to catch
+        p.sleeping = false; p.eyes = .open; p.earPerk = 4; p.headDrop = -1; p.tailSpeed = 4
+    }
+    let ta = now.timeIntervalSince(x.alertAt)
+    if ta < 6 {
+        p.alert = true; p.sleeping = false; p.eyes = .open; p.earPerk = -4; p.worried = true; p.headDrop = 0
+    }
+    let tcatch = now.timeIntervalSince(x.caughtAt)
+    if tcatch < 0.9 {
+        p.sleeping = false; p.eyes = .happy; p.earPerk = 3
+        p.lift = max(p.lift, 12 * CGFloat(sin(tcatch / 0.9 * .pi)))
+    }
+    let tc = now.timeIntervalSince(x.celebrateAt)
+    if tc < 3 {
+        p.confetti = tc / 3; p.sleeping = false; p.eyes = .happy; p.smile = true; p.headDrop = 0
+        if tc < 0.7 { p.lift = max(p.lift, 18 * CGFloat(sin(tc / 0.7 * .pi))) }
     }
 
     if tp < 1.6 {                                    // petted
@@ -70,8 +117,8 @@ func drawKitty(_ c: GraphicsContext, size: CGSize, pose p: Pose, time t: Double)
     tail.addCurve(to: CGPoint(x: cx + 23 + sway * 0.6, y: ground - 24 - L + abs(sway) * 0.3),
                   control1: CGPoint(x: cx + 27, y: ground - 3 - L),
                   control2: CGPoint(x: cx + 20 + sway, y: ground - 14 - L))
-    c.stroke(tail, with: .color(line), style: StrokeStyle(lineWidth: 6.5, lineCap: .round))
-    c.stroke(tail, with: .color(fur), style: StrokeStyle(lineWidth: 3.6, lineCap: .round))
+    c.stroke(tail, with: .color(line), style: StrokeStyle(lineWidth: p.alert ? 10 : 6.5, lineCap: .round))
+    c.stroke(tail, with: .color(fur), style: StrokeStyle(lineWidth: p.alert ? 7 : 3.6, lineCap: .round))
 
     // body
     let bh = 22 * p.squash
@@ -147,6 +194,15 @@ func drawHead(_ c: GraphicsContext, hx: CGFloat, hy: CGFloat, r: CGFloat, pose p
         c.stroke(e, with: .color(line), style: StrokeStyle(lineWidth: 1.4, lineCap: .round))
     }
 
+    // worried brows: inner ends raised
+    if p.worried {
+        for side in [-1.0, 1.0] as [CGFloat] {
+            var b = Path()
+            b.move(to: CGPoint(x: hx + side * 2.4, y: hy - 6)); b.addLine(to: CGPoint(x: hx + side * 6.8, y: hy - 4.3))
+            c.stroke(b, with: .color(line), style: StrokeStyle(lineWidth: 1.2, lineCap: .round))
+        }
+    }
+
     // nose + mouth
     var nose = Path()
     nose.move(to: CGPoint(x: hx - 1.4, y: hy + 3)); nose.addLine(to: CGPoint(x: hx + 1.4, y: hy + 3))
@@ -182,6 +238,47 @@ func drawExtras(_ c: GraphicsContext, hx: CGFloat, hy: CGFloat, pose p: Pose, ti
         }
     }
 
+    // sweat drop
+    if p.sweat {
+        var d = Path()
+        let x = hx + 12.5, y = hy - 8 + CGFloat((t * 0.8).truncatingRemainder(dividingBy: 1)) * 3
+        d.move(to: CGPoint(x: x, y: y - 3.5))
+        d.addQuadCurve(to: CGPoint(x: x, y: y + 2.5), control: CGPoint(x: x + 4, y: y + 1.5))
+        d.addQuadCurve(to: CGPoint(x: x, y: y - 3.5), control: CGPoint(x: x - 4, y: y + 1.5))
+        c.fill(d, with: .color(Color(red: 0.55, green: 0.78, blue: 0.98)))
+    }
+
+    // alert "!"
+    if p.alert {
+        let bang = Text("!").font(.system(size: 13, weight: .black, design: .rounded))
+            .foregroundColor(Color(red: 0.94, green: 0.29, blue: 0.36))
+        c.draw(bang, at: CGPoint(x: hx + 14, y: hy - 15))
+    }
+
+    // sparkles while downloading fast
+    if p.sparkle {
+        for (i, (dx, dy)) in [(-16.0, -10.0), (15.0, -14.0), (-12.0, -20.0)].enumerated() {
+            let k = (t * 0.9 + Double(i) / 3).truncatingRemainder(dividingBy: 1)
+            let s = Text("✦").font(.system(size: 5 + 4 * sin(k * .pi))).foregroundColor(Color(red: 0.78, green: 0.62, blue: 0.95).opacity(sin(k * .pi)))
+            c.draw(s, at: CGPoint(x: hx + CGFloat(dx), y: hy + CGFloat(dy)))
+        }
+    }
+
+    // confetti when everything is done
+    if let k = p.confetti {
+        let colors: [Color] = [Color(red: 0.76, green: 0.6, blue: 0.95), Color(red: 0.96, green: 0.55, blue: 0.66),
+                               Color(red: 0.4, green: 0.8, blue: 0.6), Color(red: 0.98, green: 0.82, blue: 0.4)]
+        for i in 0..<14 {
+            let a = Double(i) / 14 * 2 * .pi + Double(i % 3) * 0.3
+            let v = 22 + Double(i % 4) * 6
+            let x = hx + CGFloat(cos(a) * v * k), y = hy - 6 - CGFloat(sin(a) * v * k) + CGFloat(28 * k * k)
+            var pc = c
+            pc.translateBy(x: x, y: y); pc.rotate(by: .radians(a + k * 9))
+            pc.fill(Path(roundedRect: CGRect(x: -1.6, y: -1, width: 3.2, height: 2), cornerRadius: 0.5),
+                    with: .color(colors[i % colors.count].opacity(1 - k * 0.8)))
+        }
+    }
+
     // zzz
     if p.sleeping {
         for i in 0..<3 {
@@ -197,6 +294,7 @@ nonisolated(unsafe) var kittyFrames = 0   // frames drawn, for the stress test's
 struct KittyView: View {
     @ObservedObject var model: Model
     var frozenAt: Date? = nil      // snapshots render a single moment
+    var mood: KittyContext? = nil  // snapshots: a specific mood instead of the live one
 
     var body: some View {
         Group {
@@ -215,13 +313,14 @@ struct KittyView: View {
     var napping: Bool {
         let now = Date()
         return !model.expanded && !model.isActive && now.timeIntervalSince(model.toggledAt) > 2.5
-            && now.timeIntervalSince(model.pettedAt) > 1.6
+            && now.timeIntervalSince(model.pettedAt) > 1.6 && now.timeIntervalSince(model.celebrateAt) > 3.5
+            && now.timeIntervalSince(model.alertAt) > 6 && now.timeIntervalSince(model.caughtAt) > 1
+            && !model.dropTarget && model.offer == nil
     }
 
     func canvas(_ date: Date) -> some View {
         if frozenAt == nil { kittyFrames += 1 }
-        let p = pose(at: date, expanded: model.expanded, toggledAt: model.toggledAt,
-                     pettedAt: model.pettedAt, active: model.isActive)
+        let p = pose(at: date, mood ?? model.kittyContext)
         return Canvas { c, size in drawKitty(c, size: size, pose: p, time: date.timeIntervalSinceReferenceDate) }
     }
 }

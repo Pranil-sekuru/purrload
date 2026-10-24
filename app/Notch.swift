@@ -59,7 +59,7 @@ struct NotchView: View {
     var measuring: Bool? = nil        // off-screen copies: true = open, false = closed
 
     var open: Bool { measuring ?? model.expanded }
-    var flashing: Bool { model.flashTitle != nil }
+    var flashing: Bool { model.wide }
     var spring: Animation { .spring(response: 0.38, dampingFraction: 0.82) }
 
     var body: some View {
@@ -76,9 +76,13 @@ struct NotchView: View {
         .frame(width: metrics.width(open: open, flashing: flashing), alignment: .top)
         .background(NotchShape(bottomRadius: open ? 22 : 11).fill(Color.black))
         .contentShape(Rectangle())      // hover opens/closes it (see AppDelegate.handleHover); right-click for options
+        .modifier(LinkDropTarget(model: model, enabled: measuring == nil && kittyAt == nil))
         .contextMenu {
             Button(model.status?.paused == true ? "Resume downloads" : "Pause downloads") { model.togglePause() }
             Button("Open folder") { model.openFolder() }
+            Button(model.watchClipboard ? "✓ Offer copied download links" : "Offer copied download links") {
+                model.watchClipboard.toggle()
+            }
             Button("Move to corner") { model.switchMode?() }
             Divider()
             Button("Quit") { NSApp.terminate(nil) }
@@ -94,7 +98,7 @@ struct NotchView: View {
             }
             Spacer(minLength: metrics.notchWidth)
             HStack(spacing: 4) {
-                if flashing && !open { Text("ready ✓").lineLimit(1).foregroundStyle(Color.mint) }
+                if flashing && !open { Text(rightText).lineLimit(1).foregroundStyle(rightColor) }
                 KittyView(model: model, frozenAt: measuring != nil ? Date() : kittyAt)
                     .scaleEffect(NotchMetrics.kittyScale)
                     .frame(width: NotchMetrics.kittySize.width, height: NotchMetrics.kittySize.height)
@@ -114,13 +118,23 @@ struct NotchView: View {
     }
 
     var leftText: String {
+        if model.dropTarget { return "Drop to download" }
         if let f = model.flashTitle { return f }
+        if let o = model.offer { return "Download \(Links.displayName(o).prefix(18))?" }
         if !model.guardRunning { return "off" }
         return model.jobs.isEmpty ? "✦" : "\(Int(model.overall * 100))%"
     }
 
+    var rightText: String {
+        if model.dropTarget { return "↓" }
+        if let f = model.flashTitle { return f.hasPrefix("⚠") ? "check it" : f.hasPrefix("Added") || f.hasPrefix("Queued") ? "↓" : "ready ✓" }
+        return model.offer != nil ? "hover ↓" : ""
+    }
+    var rightColor: Color { model.flashTitle?.hasPrefix("⚠") == true ? Color.gem : model.offer != nil ? Color.lilac : Color.mint }
+
     var details: some View {
         VStack(alignment: .leading, spacing: 13) {
+            OfferRow(model: model)
             HStack {
                 Text(headline).font(.system(size: 12.5, weight: .semibold)).foregroundStyle(Color.ink)
                 Spacer()
@@ -147,6 +161,7 @@ struct NotchView: View {
     }
 
     var headline: String {
+        if model.jobs.isEmpty && model.guardRunning { return "Drop a link here to download" }
         if !model.guardRunning { return "Engine isn't running" }
         if model.status?.paused == true { return "Paused" }
         let n = model.activeJobs.count
