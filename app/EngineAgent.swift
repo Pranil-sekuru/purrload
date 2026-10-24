@@ -20,7 +20,7 @@ enum EngineAgent {
         FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/LaunchAgents/\(label).plist")
     }
     static func engineCopy(_ base: URL) -> URL { base.appendingPathComponent("engine/purrload-engine.py") }
-    static var bundledEngine: URL? { Bundle.main.url(forResource: "purrload-engine", withExtension: "py") }
+    static var bundledEngine: URL? { Bundle.main.url(forResource: "purrload-engine", withExtension: "py", subdirectory: "engine") }
     static var isInstalled: Bool { FileManager.default.fileExists(atPath: plistURL.path) }
 
     static func plistData(base: URL, engine: URL) throws -> Data {
@@ -53,15 +53,18 @@ enum EngineAgent {
         return (p.terminationStatus, String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines))
     }
 
-    /// Put the bundled engine where launchd will run it. Returns the copy's path.
+    /// Put the bundled engine where launchd will run it: every file of it (it runs inspect.py to read torrents).
+    /// Returns the engine's path.
     @discardableResult
     static func copyEngine(base: URL) throws -> URL {
         guard let bundled = bundledEngine else { throw AgentError("This build of Purrload has no engine inside it.") }
-        let dest = engineCopy(base)
-        try FileManager.default.createDirectory(at: dest.deletingLastPathComponent(), withIntermediateDirectories: true)
-        let data = try Data(contentsOf: bundled)
-        if (try? Data(contentsOf: dest)) != data { try data.write(to: dest, options: .atomic) }
-        return dest
+        let fm = FileManager.default, src = bundled.deletingLastPathComponent(), dest = engineCopy(base).deletingLastPathComponent()
+        try fm.createDirectory(at: dest, withIntermediateDirectories: true)
+        for name in try fm.contentsOfDirectory(atPath: src.path) where name.hasSuffix(".py") {
+            let data = try Data(contentsOf: src.appendingPathComponent(name)), to = dest.appendingPathComponent(name)
+            if (try? Data(contentsOf: to)) != data { try data.write(to: to, options: .atomic) }
+        }
+        return engineCopy(base)
     }
 
     /// After an app update: bring the copy up to date. A running engine keeps its old code until its next restart,

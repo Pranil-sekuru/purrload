@@ -957,6 +957,8 @@ func selftest(to path: String) {
     let copy = try? EngineAgent.copyEngine(base: tmp)
     check("the app carries the engine and copies it to Application Support",
           copy.map { FileManager.default.contentsEqual(atPath: $0.path, andPath: EngineAgent.bundledEngine?.path ?? "") } == true)
+    check("the copy includes inspect.py, which the engine runs to read torrents",
+          FileManager.default.fileExists(atPath: EngineAgent.engineCopy(tmp).deletingLastPathComponent().appendingPathComponent("inspect.py").path))
     if let d = try? EngineAgent.plistData(base: tmp, engine: EngineAgent.engineCopy(tmp)),
        let p = try? PropertyListSerialization.propertyList(from: d, format: nil) as? [String: Any] {
         check("engine agent starts at login and restarts the engine", p["RunAtLoad"] as? Bool == true && p["KeepAlive"] as? Bool == true)
