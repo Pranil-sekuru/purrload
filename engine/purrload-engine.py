@@ -30,10 +30,18 @@ PAUSE = f"{BASE}/PAUSE" # touch to pause all curl downloads, delete to resume
 INBOX = f"{BASE}/inbox" # the app drops {"url": ...} files here to start a download
 DOWNLOADS = os.environ.get("PURRLOAD_DOWNLOADS", f"{HOME}/Downloads")
 SETTINGS = f"{BASE}/settings.json"   # written by the app: {"downloadFolder": "/path"}
+JOBS_FILE = f"{BASE}/jobs.json"      # the engine's own downloads, so a restart picks them up again (private: has links)
+FINISHED = ("verified", "corrupt", "skipped", "danger")
 INSPECT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "inspect.py")
 ARIA2 = None if os.environ.get("PURRLOAD_NO_ARIA2") else (shutil.which("aria2c") or
         next((p for p in ("/opt/homebrew/bin/aria2c", "/usr/local/bin/aria2c") if os.path.exists(p)), None))
-DIRECT_HANG_SECS = 90   # dropped download alive but no bytes this long -> restart it
+DIRECT_HANG_SECS = 90   # web download alive but no bytes this long -> restart it
+TORRENT_HANG_SECS = 600 # torrents go quiet while finding peers; restarting throws the peers away, so wait much longer
+# Speed: aria2's defaults are conservative. More peers, keep looking for peers until it's fast, local peer
+# discovery, and a write cache (helps a lot on USB / exFAT drives). No extra trackers are added: that would
+# leak private torrents to outside servers.
+TORRENT_SPEED = ["--bt-max-peers=150", "--bt-request-peer-speed-limit=20M", "--bt-enable-lpd=true",
+                 "--enable-peer-exchange=true", "--enable-dht=true", "--disk-cache=64M"]
 VIDEO_EXTS = (".mkv", ".webm", ".mp4", ".m4v", ".mov")
 
 def log(msg):
@@ -240,13 +248,14 @@ class Runner:
 
 class DirectJob:
     """A download Purrload runs itself (dropped/accepted in the app). One worker thread per job."""
-    def __init__(self, url):
+    def __init__(self, url, saved=None):
         self.id = str(uuid.uuid4())
         self.url = url
         # a magnet, a .torrent file on disk, or a web link to a .torrent file (query strings allowed)
         self.torrent = url.startswith("magnet:") or urlparse(url).path.lower().endswith(".torrent")
         base = download_folder()
-        self.folder = os.path.join(base, "Torrents") if self.torrent else base
+        # torrents get their own Torrents folder inside ~/Downloads; a folder the user picked is used as it is
+        self.folder = os.path.join(base, "Torrents") if self.torrent and os.path.abspath(base) == os.path.abspath(DOWNLOADS) else base
         self.name = self.title = "Magnet link" if url.startswith("magnet:") else (
             os.path.basename(urlparse(url).path) or "download")
         self.state = "starting"          # starting -> metadata (magnets) -> choosing (torrents) -> downloading -> verified | corrupt | danger
@@ -261,7 +270,23 @@ class DirectJob:
         self.part = None                 # http: the .part file being written
         self.hist = deque(maxlen=12)
         self.last_growth = time.time()
+        self.final = None                # http: where it ends up (kept so a restart resumes the same .part)
+        if saved:                        # picked up again after an engine restart
+            self.id = saved["id"]
+            for k in ("folder", "name", "title", "total", "path", "message", "final"):
+                if saved.get(k) is not None: setattr(self, k, saved[k])
+            if saved.get("selection") is not None:
+                self.selection = saved["selection"]
+                self.chosen.set()        # files were already chosen: don't ask again
+            if saved.get("state") in FINISHED:
+                self.state = saved["state"]
+                return                   # nothing left to do, it's just a row in the list
         threading.Thread(target=self.work, daemon=True).start()
+
+    def saved(self):
+        return {"id": self.id, "url": self.url, "folder": self.folder, "selection": self.selection, "state": self.state,
+                "name": self.name, "title": self.title, "total": self.total, "path": self.path, "message": self.message,
+                "final": self.final}
 
     # ----- progress, read by the main loop -----
     def done_bytes(self):
@@ -312,13 +337,14 @@ class DirectJob:
     def work_http(self):
         name, self.total = probe(self.url)
         self.set_name(name)
-        final = unique_path(self.folder, name)
+        final = self.final or unique_path(self.folder, name)   # after a restart: the same file, so it resumes
+        self.final = final
         self.part = final + ".part"
         self.state = "downloading"
         log(f"{self.name}: downloading to {self.folder} ({fmt_bytes(self.total) if self.total else 'size unknown'})")
         if ARIA2:
             make = lambda: [ARIA2, self.url, "-d", self.folder, "-o", os.path.basename(self.part), "-c",
-                            "-x8", "-s8", "-k1M", "--file-allocation=none", "--auto-file-renaming=false",
+                            "-x16", "-s16", "-k1M", "--disk-cache=32M", "--file-allocation=none", "--auto-file-renaming=false",
                             "--allow-overwrite=true", "--console-log-level=error", "--summary-interval=0",
                             "--max-tries=5", "--retry-wait=3"]
         else:
@@ -377,8 +403,9 @@ class DirectJob:
         self.set_name(name)                          # the real name, as soon as we know it
         if all(f["blocked"] for f in self.files):
             return self.fail("every file in it was flagged by the safety check", "danger")
-        self.state = "choosing"                      # wait for the user to pick files in the app
-        log(f"{self.name}: {len(self.files)} files, waiting for the user to choose")
+        if not self.chosen.is_set():                 # wait for the user to pick files in the app
+            self.state = "choosing"                  # (a restored download already has its choices)
+            log(f"{self.name}: {len(self.files)} files, waiting for the user to choose")
         self.chosen.wait()
         if self.removed:
             return
@@ -395,7 +422,7 @@ class DirectJob:
         log(f"{self.name}: torrent, fetching {len(picked)} chosen file(s)")
         make = lambda: [ARIA2, "-d", self.folder, "-T", tor, f"--select-file={sel}", "--bt-remove-unselected-file=true",
                         "-c", "--file-allocation=none", "--seed-time=0", "--max-tries=0", "--retry-wait=5",
-                        "--console-log-level=error", "--summary-interval=0"]
+                        "--console-log-level=error", "--summary-interval=0", *TORRENT_SPEED]
         if not self.attempts(make, True, lambda: self.run.proc.returncode == 0):
             return self.fail("torrent download kept failing")
         check = subprocess.run([sys.executable, "-I", INSPECT, "check", os.path.join(self.folder, name)],
@@ -667,14 +694,35 @@ class Engine:
         j.hist.append((now, size))
         if self.paused and j.run:
             j.run.stop()              # the worker waits for PAUSE to go away, then resumes
-        elif j.state == "downloading" and j.run and j.run.alive() and now - j.last_growth > DIRECT_HANG_SECS:
-            log(f"{j.name}: no bytes for {DIRECT_HANG_SECS}s, restarting")
+        elif j.state == "downloading" and j.run and j.run.alive() and \
+                now - j.last_growth > (TORRENT_HANG_SECS if j.torrent else DIRECT_HANG_SECS):
+            log(f"{j.name}: no bytes for {TORRENT_HANG_SECS if j.torrent else DIRECT_HANG_SECS}s, restarting")
             j.last_growth = now
             j.run.stop()
+
+    def save_jobs(self):
+        items = [j.saved() for j in self.jobs.values() if isinstance(j, DirectJob)]
+        tmp = JOBS_FILE + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)   # only this user can read it: it has the links
+        with os.fdopen(fd, "w") as f:
+            json.dump(items, f)
+        os.replace(tmp, JOBS_FILE)
+
+    def restore_jobs(self):
+        try:
+            items = json.load(open(JOBS_FILE))
+        except (OSError, ValueError):
+            return
+        for s in items:
+            j = DirectJob(s["url"], saved=s)
+            self.jobs[j.id] = j
+            if j.state not in FINISHED:
+                log(f"{j.name}: picked up again after a restart")
 
     def run(self):
         log(f"engine started (pid {os.getpid()}, aria2 {'found' if ARIA2 else 'not found'})")
         os.makedirs(INBOX, exist_ok=True)
+        self.restore_jobs()
         while True:
             self.take_inbox()
             entries = self.read_plist()
@@ -701,6 +749,7 @@ class Engine:
                     log(f"{j.name}: error {e!r}")
             self.keep_awake()
             self.write_status()
+            self.save_jobs()
             for _ in range(TICK if self.active() else 10):   # check the inbox every second
                 time.sleep(1)
                 if os.listdir(INBOX):

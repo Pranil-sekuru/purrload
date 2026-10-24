@@ -23,7 +23,7 @@ Purrload keeps your Safari downloads alive. It stops your Mac from sleeping mid-
 - Finished downloads get **Show in Finder**, failed ones get **Retry**, and both can be cleared with **Remove**.
 
 **Choose where downloads go**
-- Click the little cat-folder in the open notch to pick a recent folder or **Choose another folder…**. Web downloads go straight into it; torrents go into a `Torrents` folder inside it.
+- Click the little cat-folder in the open notch to pick a recent folder or **Choose another folder…**. Downloads go straight into it (until you pick one, torrents go to `~/Downloads/Torrents`).
 - A torrent can be sent somewhere else from its file picker (**Save to**), without changing the default.
 - If the folder is on a drive that isn't plugged in, Purrload says so instead of saving somewhere else.
 

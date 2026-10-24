@@ -1005,7 +1005,9 @@ func selftest(to path: String) {
           && Folders.name("/Volumes/Backup Plus") == "Backup Plus")
     check("an unplugged drive is noticed", Folders.isUnplugged("/Volumes/Definitely Not Plugged In/x") && !Folders.isUnplugged(NSHomeDirectory()))
     if let tj = st?.jobs.first {
-        check("torrents go to a Torrents folder by default", m.torrentFolder(for: tj) == "/tmp/f2/Torrents")
+        check("torrents go straight into a folder you picked", m.torrentFolder(for: tj) == "/tmp/f2")
+        m.downloadFolder = Model.defaultFolder
+        check("with no folder picked, torrents go to Downloads/Torrents", m.torrentFolder(for: tj) == Model.defaultFolder + "/Torrents")
         m.torrentFolders[tj.id] = "/tmp/elsewhere"
         let before2 = Set((try? FileManager.default.contentsOfDirectory(atPath: inbox.path)) ?? [])
         m.startTorrent(tj)

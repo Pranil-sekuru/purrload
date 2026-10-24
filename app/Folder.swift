@@ -33,9 +33,10 @@ extension Model {
         announce("Saving to \(Folders.name(path).prefix(20))")
     }
 
-    /// Where a torrent will go: chosen just for it, or the Torrents folder inside the download folder.
+    /// Where a torrent will go: chosen just for it; else the folder you picked; else ~/Downloads/Torrents.
     func torrentFolder(for j: Job) -> String {
-        torrentFolders[j.id] ?? (downloadFolder as NSString).appendingPathComponent("Torrents")
+        if let f = torrentFolders[j.id] { return f }
+        return downloadFolder == Model.defaultFolder ? (downloadFolder as NSString).appendingPathComponent("Torrents") : downloadFolder
     }
 }
 
