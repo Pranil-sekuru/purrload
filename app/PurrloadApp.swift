@@ -21,6 +21,7 @@ struct Job: Decodable, Identifiable {
     var files: [TorrentFile]? = nil     // torrents waiting for the user to choose
     var canRetry: Bool? = nil
     var path: String? = nil             // finished: what "Show in Finder" selects
+    var stall: String? = nil            // why the speed is 0, from the engine
 
     var fraction: Double { total > 0 ? min(done / total, 1) : 0 }
     var active: Bool { ["downloading", "takeover", "failed", "starting", "metadata"].contains(state) }
@@ -384,6 +385,7 @@ struct Row: View {
         case "choosing": return "\(job.files?.count ?? 0) files · pick what to download"
         case "danger":   return "⚠ " + (job.message ?? "Flagged by the safety check: don't open it")
         default:
+            if let s = job.stall { return "\(gb(job.done)) of \(gb(job.total)) · \(s)" }
             return "\(gb(job.done)) of \(gb(job.total)) · \(mbs(job.speed)) · \(left(job.eta))"
         }
     }
@@ -519,6 +521,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.build()
         }
         build()
+        if !CommandLine.arguments.contains("--stress") && !useDemoData {
+            EngineAgent.refreshCopy(base: model.base)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in    // after the notch is up
+                MainActor.assumeIsolated { if let self { EngineAgentPrompt.askIfNeeded(model: self.model) } }
+            }
+        }
 
         watch = model.objectWillChange.sink { [weak self] _ in
             DispatchQueue.main.async { MainActor.assumeIsolated { self?.resizeToFit() } }
@@ -944,6 +952,18 @@ func selftest(to path: String) {
     check("dropped plain text is rejected", Links.accept("hello there") == nil)
     check("dropped file that isn't a .torrent is rejected", Links.accept("/Users/x/Documents/notes.txt") == nil)
     check("magnet display name comes from dn=", Links.displayName("magnet:?xt=urn:btih:abc&dn=Sintel%204K") == "Sintel 4K")
+
+    // engine agent (launchd): only the plist and the engine copy, never launchctl
+    let copy = try? EngineAgent.copyEngine(base: tmp)
+    check("the app carries the engine and copies it to Application Support",
+          copy.map { FileManager.default.contentsEqual(atPath: $0.path, andPath: EngineAgent.bundledEngine?.path ?? "") } == true)
+    if let d = try? EngineAgent.plistData(base: tmp, engine: EngineAgent.engineCopy(tmp)),
+       let p = try? PropertyListSerialization.propertyList(from: d, format: nil) as? [String: Any] {
+        check("engine agent starts at login and restarts the engine", p["RunAtLoad"] as? Bool == true && p["KeepAlive"] as? Bool == true)
+        check("engine agent runs the Application Support copy", (p["ProgramArguments"] as? [String])?.last == EngineAgent.engineCopy(tmp).path)
+        check("engine agent can find Homebrew's aria2", ((p["EnvironmentVariables"] as? [String: String])?["PATH"] ?? "").contains("/opt/homebrew/bin"))
+        check("engine agent keeps crashes in crash.log", (p["StandardErrorPath"] as? String)?.hasSuffix("/crash.log") == true)
+    } else { check("engine agent plist builds", false) }
 
     setenv("PURRLOAD_HOME", tmp.path, 1)
     let m = Model()

@@ -9,6 +9,7 @@ VERSION="0.1.0"
 
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 [[ -f "$ROOT/app/Resources/AppIcon.icns" ]] && cp "$ROOT/app/Resources/AppIcon.icns" "$APP/Contents/Resources/"
+cp "$ROOT/engine/purrload-engine.py" "$APP/Contents/Resources/"     # the app installs it for launchd (EngineAgent.swift)
 swiftc -O -swift-version 5 -parse-as-library "$ROOT"/app/*.swift -o "$APP/Contents/MacOS/Purrload"
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

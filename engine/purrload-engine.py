@@ -8,7 +8,7 @@
   over and resumes it with curl range requests (same byte offset, same URL).
 - Verifies finished files (exact size + Matroska/MP4 header) and notifies.
 """
-import os, re, sys, time, json, traceback, plistlib, subprocess, shutil, threading, uuid, tempfile, fcntl, termios, struct
+import os, re, sys, time, json, signal, traceback, plistlib, subprocess, shutil, threading, uuid, tempfile, fcntl, termios, struct
 from collections import deque
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse, parse_qs
@@ -214,6 +214,7 @@ def unique_path(folder, name):
 UNIT = {"B": 1, "KiB": 1024, "MiB": 1024 ** 2, "GiB": 1024 ** 3, "TiB": 1024 ** 4}
 READOUT = re.compile(r"\[#\w+ (?:SEED\([^)]*\) )?([\d.]+)(B|KiB|MiB|GiB|TiB)/([\d.]+)(B|KiB|MiB|GiB|TiB)")
 READOUT_DL = re.compile(r"DL:([\d.]+)(B|KiB|MiB|GiB|TiB)")
+READOUT_PEERS = re.compile(r"CN:(\d+)(?: SD:(\d+))?")     # connections, and for torrents how many of them are seeders
 
 class Runner:
     """A download subprocess. For aria2 it parses the live readout ([#id 1.2GiB/2.5GiB(48%) ...]),
@@ -222,6 +223,7 @@ class Runner:
     def __init__(self, args, parse):
         self.done = self.total = self.speed = 0
         self.heard = 0.0                 # when aria2 last printed its progress
+        self.conns = self.seeds = None   # from the readout, to explain a stall
         self.parsed = parse
         if not parse:
             self.proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -252,6 +254,9 @@ class Runner:
                     self.total = float(m.group(3)) * UNIT[m.group(4)]
                     d = READOUT_DL.search(text)    # aria2's own speed: the sizes above are rounded to 0.1 GiB
                     self.speed = float(d.group(1)) * UNIT[d.group(2)] if d else 0
+                    p = READOUT_PEERS.search(text)
+                    self.conns = int(p.group(1)) if p else 0
+                    self.seeds = int(p.group(2)) if p and p.group(2) else 0
                     self.heard = time.time()
 
     def alive(self):
@@ -321,6 +326,29 @@ class DirectJob:
             return 0
         (t0, s0), (t1, s1) = self.hist[0], self.hist[-1]
         return max(0, (s1 - s0) / (t1 - t0)) if t1 > t0 else 0
+
+    def stall(self, gateway, now):
+        """Why the speed is 0, in words for the app; None while it's moving (or only briefly at 0)."""
+        if self.state != "downloading" or self.speed() > 0:
+            self.zero_since = None
+            return None
+        self.zero_since = getattr(self, "zero_since", None) or now
+        if now - self.zero_since < 10:
+            return None
+        hotspot = (gateway or "").startswith("172.20.10.")      # the subnet an iPhone hotspot hands out
+        if gateway is None:
+            return "No internet · carries on when it's back"
+        r = self.run
+        if r and r.parsed and r.alive() and now - r.heard >= 3:
+            slow = filesystem(self.folder) in ("exfat", "msdos", "vfat")
+            return "Waiting on the drive" + (" · slow USB disk, normal" if slow else " · it's busy writing")
+        if self.torrent and r and r.conns == 0:
+            return "Looking for peers" + (" · hotspots block incoming peers" if hotspot else " · nobody's online right now")
+        if self.torrent and r and r.conns:
+            return f"{r.conns} peers, none sending" + (" · hotspot may be throttled" if hotspot else " · usually comes back")
+        if not self.torrent:
+            return "The server stopped sending · Purrload keeps retrying"
+        return None
 
     def set_name(self, name):
         self.title = pretty(name)
@@ -634,7 +662,8 @@ class Engine:
                 items.append({"id": j.id, "name": j.name, "title": j.title, "state": j.state, "done": size,
                               "total": j.total, "speed": sp, "eta": (j.total - size) / sp if sp > 0 and j.total else None,
                               "folder": j.folder, "message": j.message, "files": j.files if j.state == "choosing" else None,
-                              "canRetry": j.state in ("corrupt", "skipped"), "path": j.path})
+                              "canRetry": j.state in ("corrupt", "skipped"), "path": j.path,
+                              "stall": j.stall(self.gateway, time.time())})
                 rows.append(f"{j.name[:8]:8} {j.state:11} {100 * size / j.total if j.total else 0:5.1f}%  "
                             f"{fmt_bytes(size):>9} / {fmt_bytes(j.total):<9} {sp / 1048576:5.2f} MB/s")
                 continue
@@ -737,6 +766,21 @@ class Engine:
             if j.state not in FINISHED:
                 log(f"{j.name}: picked up again after a restart")
 
+    def shutdown(self, signum, frame):
+        """Asked to stop (launchd, or the app handing over to a new engine): save the downloads, stop aria2 so
+        nothing is left writing the files, and leave. The saved downloads are picked up again at the next start."""
+        log("asked to stop: saving downloads and stopping aria2")
+        try: self.save_jobs()
+        except Exception: pass
+        runs = [j.run for j in list(self.jobs.values()) if isinstance(j, DirectJob) and j.run and j.run.alive()]
+        for r in runs:
+            r.proc.terminate()
+        deadline = time.time() + 15
+        for r in runs:
+            try: r.proc.wait(max(0.1, deadline - time.time()))
+            except subprocess.TimeoutExpired: r.proc.kill()
+        os._exit(0)      # not sys.exit: the download workers are threads and would restart what we just stopped
+
     def tick(self):
         self.take_inbox()
         entries = self.read_plist()
@@ -780,6 +824,28 @@ class Engine:
                     break
 
 if __name__ == "__main__":
+    os.makedirs(BASE, exist_ok=True)
+    lock = open(f"{BASE}/engine.lock", "w")      # kept open for the engine's whole life
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("Purrload engine is already running.")
+        sys.exit(0)
     # a previous engine's curls may still be writing our .part files: stop them first
     subprocess.run(["pkill", "-f", "curl -sS -L -C - --retry 30"], capture_output=True)
-    Engine().run()
+    # same for aria2: an engine that was killed hard leaves its aria2 running on the same files. Only orphans
+    # (parent gone) with the flag only our Runner adds; aria2 can sit in disk wait for a while before it exits.
+    def orphan_aria2():
+        ps = subprocess.run(["ps", "-axo", "pid=,ppid=,command="], capture_output=True, text=True).stdout
+        return [int(pid) for pid, ppid, cmd in (l.split(None, 2) for l in ps.splitlines() if l.count(" ") >= 2)
+                if ppid == "1" and "aria2c" in cmd and "--enable-color=false" in cmd]
+    for pid in orphan_aria2():
+        try: os.kill(pid, signal.SIGTERM)
+        except OSError: pass
+    for _ in range(60):
+        if not orphan_aria2():
+            break
+        time.sleep(1)
+    engine = Engine()
+    signal.signal(signal.SIGTERM, engine.shutdown)
+    engine.run()
