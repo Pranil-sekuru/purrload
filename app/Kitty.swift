@@ -27,7 +27,6 @@ struct Pose {
     var confetti: Double? = nil    // 0...1, everything finished
 }
 
-/// What's going on, as far as the kitty cares.
 struct KittyContext {
     var expanded = false
     var toggledAt = Date.distantPast
@@ -185,7 +184,6 @@ private func kittyBlob(_ c: GraphicsContext, _ path: Path, _ color: Color = fur)
     c.fill(path, with: .color(color)); c.stroke(path, with: .color(line), style: kittyStroke)
 }
 
-/// Ears, head and face.
 func drawHead(_ c: GraphicsContext, hx: CGFloat, hy: CGFloat, r: CGFloat, pose p: Pose) {
     func blob(_ path: Path, _ color: Color = fur) { kittyBlob(c, path, color) }
     for side in [-1.0, 1.0] as [CGFloat] {          // ears behind the head
@@ -257,7 +255,6 @@ func drawHead(_ c: GraphicsContext, hx: CGFloat, hy: CGFloat, r: CGFloat, pose p
 
 }
 
-/// Hearts and sleepy z's above the head.
 func drawExtras(_ c: GraphicsContext, hx: CGFloat, hy: CGFloat, pose p: Pose, time t: Double, zColor: Color = line) {
     // hearts
     if let h = p.hearts {

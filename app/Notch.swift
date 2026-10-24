@@ -18,7 +18,6 @@ struct NotchMetrics {
     }
     func width(open: Bool, flashing: Bool) -> CGFloat { open ? Self.openWidth : closedWidth(flashing: flashing) }
 
-    /// The notched screen, if one is connected.
     static func find() -> (NSScreen, NotchMetrics)? {
         for s in NSScreen.screens where s.safeAreaInsets.top > 0 {
             guard let l = s.auxiliaryTopLeftArea, let r = s.auxiliaryTopRightArea else { continue }

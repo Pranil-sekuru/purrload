@@ -11,7 +11,6 @@ DRY=0; RESUME=0
 [[ "${1:-}" == "--resume" ]] && { RESUME=1; shift; }
 CONN="${1:-8}"
 
-# Torrents go to the safe torrent downloader
 for arg in "$@"; do [[ "$arg" == magnet:* || "$arg" == *.torrent ]] && exec "$HERE/purr-torrent" "$@"; done
 
 if ! command -v aria2c >/dev/null; then

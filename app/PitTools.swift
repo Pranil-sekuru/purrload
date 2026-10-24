@@ -138,7 +138,6 @@ final class PitToolDelegate: NSObject, NSApplicationDelegate {
 
         var mems: [Double] = []
         let a = await wave("a")
-        // the same row can't fall twice at once
         let first = pit.drop(key: "dup", card: card, from: startRect(0), resurrect: false, style: .classic)
         let second = pit.drop(key: "dup", card: card, from: startRect(0), resurrect: false, style: .classic)
         try? await Task.sleep(for: .seconds(4.5))

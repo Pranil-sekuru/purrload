@@ -20,7 +20,7 @@ BASE = os.environ.get("PURRLOAD_HOME", f"{HOME}/Library/Application Support/Purr
 os.makedirs(BASE, exist_ok=True)
 LOG = f"{BASE}/engine.log"
 STATUS = f"{BASE}/status.txt"
-STATUS_JSON = f"{BASE}/status.json"  # read by the Purrload app
+STATUS_JSON = f"{BASE}/status.json"
 TICK = 2
 STALL_SECS = 300        # no growth this long -> stalled
 TAKEOVER_SECS = 300     # stalled AND Safari hasn't touched file this long -> curl takeover
@@ -30,7 +30,7 @@ PAUSE = f"{BASE}/PAUSE" # touch to pause all curl downloads, delete to resume
 INBOX = f"{BASE}/inbox" # the app drops {"url": ...} files here to start a download
 DOWNLOADS = os.environ.get("PURRLOAD_DOWNLOADS", f"{HOME}/Downloads")
 SETTINGS = f"{BASE}/settings.json"   # written by the app: {"downloadFolder": "/path"}
-JOBS_FILE = f"{BASE}/jobs.json"      # the engine's own downloads, so a restart picks them up again (private: has links)
+JOBS_FILE = f"{BASE}/jobs.json"      # restored after a restart; private: has links
 FINISHED = ("verified", "corrupt", "skipped", "danger")
 INSPECT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "inspect.py")
 ARIA2 = None if os.environ.get("PURRLOAD_NO_ARIA2") else (shutil.which("aria2c") or
@@ -50,11 +50,10 @@ def log(msg):
     with open(LOG, "a") as f:
         f.write(line + "\n")
 
-EVENTS = deque(maxlen=30)    # notifications for the app to show, published in status.json
+EVENTS = deque(maxlen=30)    # notifications for the app
 _event_ids = iter(range(1, 1 << 62))
 
 def app_can_notify():
-    """True if the Purrload app is running and macOS lets it show notifications (it writes that answer for us)."""
     try:
         allowed = open(f"{BASE}/notifications").read().strip() == "allowed"
     except OSError:
@@ -62,8 +61,7 @@ def app_can_notify():
     return allowed and subprocess.run(["pgrep", "-x", "Purrload"], capture_output=True).returncode == 0
 
 def notify(title, msg, path=None):
-    """Show a notification. The Purrload app posts it (with its own name and icon, and a click on a finished
-    download shows it in Finder); if the app isn't running or isn't allowed to notify, fall back to AppleScript."""
+    """Posted by the app when it can (its icon, click shows the file); otherwise AppleScript."""
     log(f"NOTIFY {title}: {msg}")
     EVENTS.append({"id": next(_event_ids), "time": time.time(), "title": title, "body": msg, "path": path})
     if not app_can_notify():
@@ -146,7 +144,6 @@ class Job:
 
 
 def download_folder():
-    """Where new downloads go: the folder chosen in the app, read fresh for every download."""
     try:
         chosen = json.load(open(SETTINGS)).get("downloadFolder")
     except (OSError, ValueError):
@@ -154,7 +151,7 @@ def download_folder():
     return os.path.expanduser(chosen) if chosen else DOWNLOADS
 
 def folder_problem(path):
-    """Why we can't save to `path` (in plain words), or None if it's fine. Never silently saves somewhere else."""
+    """Why we can't save to `path`, or None. Never silently falls back to another folder."""
     parts = os.path.abspath(path).split("/")
     if len(parts) > 2 and parts[1] == "Volumes" and not os.path.ismount(f"/Volumes/{parts[2]}"):
         return f"\u201c{parts[2]}\u201d isn't connected: plug it in or choose another folder"
@@ -167,7 +164,6 @@ def folder_problem(path):
     return None
 
 def filesystem(path):
-    """The filesystem type of the drive holding `path` (apfs, exfat, msdos, ...), from `mount`."""
     out = subprocess.run(["/sbin/mount"], capture_output=True, text=True).stdout
     best, kind = "", ""
     for line in out.splitlines():
@@ -187,7 +183,6 @@ def quarantine(path):
                    capture_output=True)
 
 def probe(url):
-    """(filename, size) for a web link, from its headers, falling back to the URL itself."""
     r = subprocess.run(["curl", "-sSIL", "--max-time", "20", url], capture_output=True, text=True, errors="replace")
     name, size = None, 0
     for line in r.stdout.splitlines():                     # last response wins (after redirects)
@@ -214,7 +209,7 @@ def unique_path(folder, name):
 UNIT = {"B": 1, "KiB": 1024, "MiB": 1024 ** 2, "GiB": 1024 ** 3, "TiB": 1024 ** 4}
 READOUT = re.compile(r"\[#\w+ (?:SEED\([^)]*\) )?([\d.]+)(B|KiB|MiB|GiB|TiB)/([\d.]+)(B|KiB|MiB|GiB|TiB)")
 READOUT_DL = re.compile(r"DL:([\d.]+)(B|KiB|MiB|GiB|TiB)")
-READOUT_PEERS = re.compile(r"CN:(\d+)(?: SD:(\d+))?")     # connections, and for torrents how many of them are seeders
+READOUT_PEERS = re.compile(r"CN:(\d+)(?: SD:(\d+))?")     # connections, seeders
 
 class Runner:
     """A download subprocess. For aria2 it parses the live readout ([#id 1.2GiB/2.5GiB(48%) ...]),
@@ -223,7 +218,7 @@ class Runner:
     def __init__(self, args, parse):
         self.done = self.total = self.speed = 0
         self.heard = 0.0                 # when aria2 last printed its progress
-        self.conns = self.seeds = None   # from the readout, to explain a stall
+        self.conns = self.seeds = None
         self.parsed = parse
         if not parse:
             self.proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -269,40 +264,37 @@ class Runner:
             except subprocess.TimeoutExpired: self.proc.kill()
 
 class DirectJob:
-    """A download Purrload runs itself (dropped/accepted in the app). One worker thread per job."""
     def __init__(self, url, saved=None):
         self.id = str(uuid.uuid4())
         self.url = url
-        # a magnet, a .torrent file on disk, or a web link to a .torrent file (query strings allowed)
         self.torrent = url.startswith("magnet:") or urlparse(url).path.lower().endswith(".torrent")
         base = download_folder()
-        # torrents get their own Torrents folder inside ~/Downloads; a folder the user picked is used as it is
         self.folder = os.path.join(base, "Torrents") if self.torrent and os.path.abspath(base) == os.path.abspath(DOWNLOADS) else base
         self.name = self.title = "Magnet link" if url.startswith("magnet:") else (
             os.path.basename(urlparse(url).path) or "download")
         self.state = "starting"          # starting -> metadata (magnets) -> choosing (torrents) -> downloading -> verified | corrupt | danger
-        self.files = None                # torrents: the file list shown in the app's picker
-        self.selection = None            # torrents: file indices the user picked
-        self.chosen = threading.Event()  # set when the user picks files, or removes the job
+        self.files = None
+        self.selection = None
+        self.chosen = threading.Event()
         self.removed = False
-        self.path = None                 # finished: what to show in Finder
+        self.path = None
         self.message = ""
         self.total = 0
-        self.run = None                  # current Runner
-        self.part = None                 # http: the .part file being written
+        self.run = None
+        self.part = None
         self.hist = deque(maxlen=12)
         self.last_growth = time.time()
-        self.final = None                # http: where it ends up (kept so a restart resumes the same .part)
-        if saved:                        # picked up again after an engine restart
+        self.final = None                # kept so a restart resumes the same .part
+        if saved:
             self.id = saved["id"]
             for k in ("folder", "name", "title", "total", "path", "message", "final"):
                 if saved.get(k) is not None: setattr(self, k, saved[k])
             if saved.get("selection") is not None:
                 self.selection = saved["selection"]
-                self.chosen.set()        # files were already chosen: don't ask again
+                self.chosen.set()
             if saved.get("state") in FINISHED:
                 self.state = saved["state"]
-                return                   # nothing left to do, it's just a row in the list
+                return
         threading.Thread(target=self.work, daemon=True).start()
 
     def saved(self):
@@ -310,7 +302,6 @@ class DirectJob:
                 "name": self.name, "title": self.title, "total": self.total, "path": self.path, "message": self.message,
                 "final": self.final}
 
-    # ----- progress, read by the main loop -----
     def done_bytes(self):
         if self.state == "verified":
             return self.total
@@ -328,7 +319,7 @@ class DirectJob:
         return max(0, (s1 - s0) / (t1 - t0)) if t1 > t0 else 0
 
     def stall(self, gateway, now):
-        """Why the speed is 0, in words for the app; None while it's moving (or only briefly at 0)."""
+        """Why the speed is 0, for the app; None while moving or only briefly at 0."""
         if self.state != "downloading" or self.speed() > 0:
             self.zero_since = None
             return None
@@ -354,7 +345,6 @@ class DirectJob:
         self.title = pretty(name)
         self.name = short(name) if re.search(r"S\d+E\d+", name) else self.title[:40]
 
-    # ----- worker thread -----
     def work(self):
         try:
             if not self.torrent and (problem := folder_problem(self.folder)):   # torrents check once a folder is chosen
@@ -369,7 +359,6 @@ class DirectJob:
         notify("Purrload", f"{self.name}: {msg}")
 
     def attempts(self, make_args, parse, complete, tries=10):
-        """Run the download command, restarting it (it resumes) until complete() or out of tries."""
         for _ in range(tries):
             while os.path.exists(PAUSE):
                 time.sleep(2)
@@ -417,11 +406,11 @@ class DirectJob:
         try:
             self.torrent_in(work)
         finally:
-            shutil.rmtree(work, ignore_errors=True)   # the fetched .torrent / magnet metadata
+            shutil.rmtree(work, ignore_errors=True)
 
     def torrent_in(self, work):
         tor = self.url
-        if re.match(r"https?://", self.url):         # a web link to a .torrent file: fetch it first
+        if re.match(r"https?://", self.url):
             tor = os.path.join(work, "download.torrent")
             r = subprocess.run(["curl", "-sSL", "--max-time", "60", "--max-filesize", "50000000", "-o", tor, self.url],
                                capture_output=True, text=True)
@@ -446,11 +435,11 @@ class DirectJob:
             return self.fail("couldn't read it: it may be damaged, or not a .torrent file")
         info = json.loads(listing.stdout)
         name, self.files = info["name"], info["files"]
-        self.set_name(name)                          # the real name, as soon as we know it
+        self.set_name(name)
         if all(f["blocked"] for f in self.files):
             return self.fail("every file in it was flagged by the safety check", "danger")
-        if not self.chosen.is_set():                 # wait for the user to pick files in the app
-            self.state = "choosing"                  # (a restored download already has its choices)
+        if not self.chosen.is_set():
+            self.state = "choosing"
             log(f"{self.name}: {len(self.files)} files, waiting for the user to choose")
         self.chosen.wait()
         if self.removed:
@@ -483,7 +472,7 @@ class Engine:
         self.jobs = {}
         self.caff = None
         self.volume_warned = set()
-        self.removed = set()                 # rows the user cleared
+        self.removed = set()
         self.gateway = default_gateway()
         self.paused = os.path.exists(PAUSE)  # start in the current state, so a restart doesn't announce "paused" again
 
@@ -599,7 +588,7 @@ class Engine:
                 self.finish(j, j.final)
                 return
             elif j.curl is None and j.curl_attempts > 0 and j.size() is not None:
-                self.start_curl(j)          # resumed after pause / network change
+                self.start_curl(j)
             elif j.curl_attempts < 10:
                 self.takeover(j, "curl exited early")
             else:
@@ -608,7 +597,7 @@ class Engine:
                 return
 
         if j.state == "downloading" and not os.path.exists(j.partial) and os.path.exists(j.final):
-            self.finish(j, j.final)    # Safari completed it
+            self.finish(j, j.final)
             return
 
         size = j.size()
@@ -688,7 +677,6 @@ class Engine:
         os.replace(tmp, STATUS_JSON)
 
     def take_inbox(self):
-        """Start downloads the app has queued."""
         try:
             names = sorted(os.listdir(INBOX))
         except FileNotFoundError:
@@ -700,11 +688,11 @@ class Engine:
             except Exception:
                 msg = {}
             os.remove(p)
-            if "select" in msg:                      # the user's picks for a torrent
+            if "select" in msg:
                 j = self.jobs.get(msg["select"])
                 if isinstance(j, DirectJob) and j.state == "choosing":
                     j.selection = [int(i) for i in msg.get("files", [])]
-                    if msg.get("folder"):               # chosen just for this torrent
+                    if msg.get("folder"):
                         j.folder = os.path.expanduser(str(msg["folder"]))
                     j.chosen.set()
             elif "retry" in msg:
@@ -714,7 +702,7 @@ class Engine:
                     n = DirectJob(j.url)
                     self.jobs[n.id] = n
                     log(f"{j.name}: retrying")
-            elif "remove" in msg:                    # clear a finished/failed row, or cancel a torrent being chosen
+            elif "remove" in msg:
                 j = self.jobs.get(msg["remove"])
                 if j and j.state not in ("downloading", "takeover", "failed", "metadata", "starting"):
                     if isinstance(j, DirectJob):
@@ -750,7 +738,7 @@ class Engine:
     def save_jobs(self):
         items = [j.saved() for j in self.jobs.values() if isinstance(j, DirectJob)]
         tmp = JOBS_FILE + ".tmp"
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)   # only this user can read it: it has the links
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)   # owner-only: it has the links
         with os.fdopen(fd, "w") as f:
             json.dump(items, f)
         os.replace(tmp, JOBS_FILE)
@@ -767,8 +755,7 @@ class Engine:
                 log(f"{j.name}: picked up again after a restart")
 
     def shutdown(self, signum, frame):
-        """Asked to stop (launchd, or the app handing over to a new engine): save the downloads, stop aria2 so
-        nothing is left writing the files, and leave. The saved downloads are picked up again at the next start."""
+        """SIGTERM: save the downloads and stop aria2 so nothing is left writing the files."""
         log("asked to stop: saving downloads and stopping aria2")
         try: self.save_jobs()
         except Exception: pass
@@ -816,16 +803,16 @@ class Engine:
         while True:
             try:
                 self.tick()
-            except Exception:       # one bad tick must not end the engine; keep the traceback
+            except Exception:       # one bad tick mustn't end the engine
                 log("tick failed, will try again:\n" + traceback.format_exc().rstrip())
-            for _ in range(TICK if self.active() else 10):   # check the inbox every second
+            for _ in range(TICK if self.active() else 10):
                 time.sleep(1)
                 if os.listdir(INBOX):
                     break
 
 if __name__ == "__main__":
     os.makedirs(BASE, exist_ok=True)
-    lock = open(f"{BASE}/engine.lock", "w")      # kept open for the engine's whole life
+    lock = open(f"{BASE}/engine.lock", "w")      # held for the engine's life
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
@@ -833,8 +820,7 @@ if __name__ == "__main__":
         sys.exit(0)
     # a previous engine's curls may still be writing our .part files: stop them first
     subprocess.run(["pkill", "-f", "curl -sS -L -C - --retry 30"], capture_output=True)
-    # same for aria2: an engine that was killed hard leaves its aria2 running on the same files. Only orphans
-    # (parent gone) with the flag only our Runner adds; aria2 can sit in disk wait for a while before it exits.
+    # and aria2 orphaned by an engine that was killed hard (only ours pass --enable-color=false)
     def orphan_aria2():
         ps = subprocess.run(["ps", "-axo", "pid=,ppid=,command="], capture_output=True, text=True).stdout
         return [int(pid) for pid, ppid, cmd in (l.split(None, 2) for l in ps.splitlines() if l.count(" ") >= 2)

@@ -43,7 +43,6 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
         }
     }
 
-    /// Called with each status update; posts events newer than the last one seen.
     func handle(_ events: [EngineEvent]) {
         let newest = events.map(\.id).max() ?? 0
         guard let last = lastSeen else { lastSeen = newest; return }

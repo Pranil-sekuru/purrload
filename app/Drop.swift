@@ -58,7 +58,6 @@ extension Model {
         return true
     }
 
-    /// Queue a link for the engine.
     func enqueue(_ link: String) {
         guard send(["url": link]) else { return }
         caughtAt = Date()
@@ -74,7 +73,6 @@ extension Model {
 
     func dismissOffer() { withAnimation(.spring(response: 0.38, dampingFraction: 0.82)) { offer = nil } }
 
-    /// Called every second: offer to download a link that was just copied.
     func checkClipboard() {
         let pb = NSPasteboard.general
         guard pb.changeCount != clipboardChange else { return }
@@ -85,7 +83,6 @@ extension Model {
     }
 }
 
-/// Drop target for the notch and the corner bar.
 struct LinkDrop: DropDelegate {
     let model: Model
     static let types: [UTType] = [.fileURL, .url, .plainText]

@@ -18,10 +18,10 @@ struct Job: Decodable, Identifiable {
     let eta: Double?
     let folder: String
     var message: String? = nil
-    var files: [TorrentFile]? = nil     // torrents waiting for the user to choose
+    var files: [TorrentFile]? = nil
     var canRetry: Bool? = nil
     var path: String? = nil             // finished: what "Show in Finder" selects
-    var stall: String? = nil            // why the speed is 0, from the engine
+    var stall: String? = nil
 
     var fraction: Double { total > 0 ? min(done / total, 1) : 0 }
     var active: Bool { ["downloading", "takeover", "failed", "starting", "metadata"].contains(state) }
@@ -87,16 +87,16 @@ final class Model: ObservableObject {
     // drop to download
     @Published var offer: String?                // a copied download link, offered for ~10s
     var offerAt = Date.distantPast
-    @Published var dropTarget = false            // a link is being dragged over
+    @Published var dropTarget = false
     var clipboardChange = NSPasteboard.general.changeCount   // ignore whatever was copied before launch
     var watchClipboard: Bool {
         get { UserDefaults.standard.object(forKey: "watchClipboard") as? Bool ?? true }
         set { UserDefaults.standard.set(newValue, forKey: "watchClipboard"); objectWillChange.send() }
     }
-    @Published var picks: [String: Set<Int>] = [:]   // torrent file choices, per job
+    @Published var picks: [String: Set<Int>] = [:]
     @Published var torrentFolders: [String: String] = [:]   // a folder chosen just for one torrent (Folder.swift)
     var rowFrames: [String: CGRect] = [:]          // where each row is in the window (for the fiery pit)
-    var toScreen: ((CGRect) -> CGRect)?            // window -> screen coordinates, set by the app delegate
+    var toScreen: ((CGRect) -> CGRect)?
     var darkRows = false                           // notch rows are drawn on black
     var swatAt = Date.distantPast
     // kitty moods
@@ -123,7 +123,7 @@ final class Model: ObservableObject {
               let s = try? JSONDecoder().decode(Status.self, from: data) else { return }
         for j in s.jobs {
             let old = lastStates[j.id]
-            if let old, old != "verified", j.state == "verified" { announce("\(j.name) ready") }   // passed its check
+            if let old, old != "verified", j.state == "verified" { announce("\(j.name) ready") }
             if old != "danger", j.state == "danger" { alertAt = Date(); announce("⚠ \(j.name) flagged") }
             if old != "choosing", j.state == "choosing" { announce("Choose files: \(j.name.prefix(16))") }
             lastStates[j.id] = j.state
@@ -146,7 +146,6 @@ final class Model: ObservableObject {
         if offer != nil && Date().timeIntervalSince(offerAt) > 10 && !expanded { dismissOffer() }
     }
 
-    /// The strip widens while it has something to say.
     var wide: Bool { flashTitle != nil || offer != nil || dropTarget }
 
     var kittyContext: KittyContext {
@@ -516,7 +515,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ note: Notification) {
         if !CommandLine.arguments.contains("--stress") { Notifier.shared.start(logTo: model.base) }
-        model.writeSettings()      // the engine reads the download folder from here
+        model.writeSettings()
         if let i = CommandLine.arguments.firstIndex(of: "--mode"), i + 1 < CommandLine.arguments.count {
             forcedMode = CommandLine.arguments[i + 1]
         }
@@ -563,7 +562,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// (Re)create the window for the current mode: notch if wanted and available, otherwise the corner bar.
     func build() {
         let wanted = forcedMode ?? UserDefaults.standard.string(forKey: "mode") ?? "notch"
         let found = NotchMetrics.find()
@@ -576,10 +574,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             host = NSHostingView(rootView: AnyView(NotchView(model: model, metrics: m)))
             measureOpen = NSHostingView(rootView: AnyView(NotchView(model: model, metrics: m, measuring: true)))
             measureClosed = NSHostingView(rootView: AnyView(NotchView(model: model, metrics: m, measuring: false)))
-            for v in [host, measureOpen, measureClosed] { v?.appearance = NSAppearance(named: .darkAqua) }   // light text on black
+            for v in [host, measureOpen, measureClosed] { v?.appearance = NSAppearance(named: .darkAqua) }
             refreshSizes()
             p = makePanel(size: notchWindowSize())
-            p.level = NSWindow.Level(rawValue: NSWindow.Level.mainMenu.rawValue + 3)   // above the menu bar
+            p.level = NSWindow.Level(rawValue: NSWindow.Level.mainMenu.rawValue + 3)
             p.isMovableByWindowBackground = false
             p.setFrameOrigin(NSPoint(x: screen.frame.midX - p.frame.width / 2, y: screen.frame.maxY - p.frame.height))
         } else {
@@ -591,7 +589,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             p = makePanel(size: openFit)
             p.level = .floating
             p.isMovableByWindowBackground = true
-            if let screen = NSScreen.main?.visibleFrame {   // bottom-right, above the Dock
+            if let screen = NSScreen.main?.visibleFrame {
                 p.setFrameOrigin(NSPoint(x: screen.maxX - 340 - 20 - Self.margin, y: screen.minY + 20 - Self.margin))
             }
         }
@@ -648,7 +646,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if mode == "notch", let screen = notchScreen {
             let size = notchWindowSize()
             guard abs(size.height - f.height) > 0.5 || abs(size.width - f.width) > 0.5 else { return }
-            p.setFrame(NSRect(x: screen.frame.midX - size.width / 2, y: screen.frame.maxY - size.height,   // stays centred on the notch
+            p.setFrame(NSRect(x: screen.frame.midX - size.width / 2, y: screen.frame.maxY - size.height,
                               width: size.width, height: size.height), display: true)
         } else {
             guard abs(openFit.height - f.height) > 0.5 || abs(openFit.width - f.width) > 0.5 else { return }
@@ -664,7 +662,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let m = notch {
             let sw = m.width(open: model.expanded, flashing: model.wide)
             let shape = CGRect(x: (w - sw) / 2, y: h - fit.height, width: sw, height: fit.height)
-            let ks = NotchMetrics.kittySize    // the kitty sits inside the right wing
+            let ks = NotchMetrics.kittySize
             let kitty = CGRect(x: shape.maxX - NotchMetrics.shoulder - 4 - ks.width, y: h - m.height, width: ks.width, height: m.height)
             return [shape, kitty]
         }
@@ -769,7 +767,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                            ("stays open for 200 ms after leaving", graceHeld), ("closes after leaving", closed)]
             lines.append("")
             for (label, ok) in results { pass += ok ? 1 : 0; lines.append("hover: \(label)  \(ok ? "ok" : "WRONG")") }
-            checks += results.map { ($0.0, .zero, true) }   // count them in the total
+            checks += results.map { ($0.0, .zero, true) }
             if model.expanded { model.toggle() }
             try? await Task.sleep(for: .seconds(0.6))
         }
@@ -785,7 +783,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
-        // "ready" announcement: widens, then clears itself after ~4s
         model.announce("S02E10 ready")
         try? await Task.sleep(for: .seconds(0.6))
         let wide = solidRects()[0].width
@@ -856,7 +853,7 @@ func snapshotNotch(to path: String) {
             ZStack(alignment: .top) {
                 LinearGradient(colors: [Color(red: 0.42, green: 0.36, blue: 0.62), Color(red: 0.86, green: 0.62, blue: 0.70)],
                                startPoint: .top, endPoint: .bottom)
-                Rectangle().fill(Color.white.opacity(0.22)).frame(height: m.height)          // menu bar
+                Rectangle().fill(Color.white.opacity(0.22)).frame(height: m.height)
                 HStack { Text("  Finder   File   Edit   View").font(.system(size: 12, weight: .medium)); Spacer()
                          Text("Sat 24 Oct  09:52  ").font(.system(size: 12, weight: .medium)) }
                     .foregroundStyle(.white).frame(height: m.height)
@@ -917,14 +914,14 @@ func snapshotNotch(to path: String) {
 /// Purrload --render-icon out.png : the 1024px app icon (kitty on lilac), turned into AppIcon.icns by scripts/make-icon.sh
 @MainActor
 func renderIcon(to path: String) {
-    let calm = KittyContext(active: true)     // awake, eyes open
+    let calm = KittyContext(active: true)
     let icon = ZStack {
         RoundedRectangle(cornerRadius: 185, style: .continuous)
             .fill(LinearGradient(colors: [Color(red: 0.80, green: 0.66, blue: 0.95), Color(red: 0.97, green: 0.80, blue: 0.87)],
                                  startPoint: .top, endPoint: .bottom))
             .frame(width: 824, height: 824)
             .shadow(color: .black.opacity(0.25), radius: 18, y: 10)
-        UnevenRoundedRectangle(bottomLeadingRadius: 34, bottomTrailingRadius: 34)                  // a little notch
+        UnevenRoundedRectangle(bottomLeadingRadius: 34, bottomTrailingRadius: 34)
             .fill(Color.black.opacity(0.9)).frame(width: 300, height: 56).offset(y: -384)
         KittyView(model: Model(), frozenAt: Date(timeIntervalSinceReferenceDate: 1.0), mood: calm)
             .scaleEffect(10).frame(width: 760, height: 720).offset(x: -22, y: -28)
@@ -1063,7 +1060,7 @@ struct PurrloadApp {
         // Purrload --snapshot out.png : render the expanded bar (light + dark) to an image for checking the design
         useDemoData = CommandLine.arguments.contains("--demo")
         let args = CommandLine.arguments
-        if let i = args.firstIndex(of: "--folder-icon"), i + 1 < args.count {    // the cat-folder, big, for checking
+        if let i = args.firstIndex(of: "--folder-icon"), i + 1 < args.count {
             MainActor.assumeIsolated {
                 let v = HStack(spacing: 30) { CatFolderIcon(size: 160); CatFolderIcon(size: 17).scaleEffect(4).frame(width: 80, height: 80) }
                     .padding(30).background(Color.black)
@@ -1091,7 +1088,7 @@ struct PurrloadApp {
                 return
             }
         }
-        if CommandLine.arguments.contains("--notify-status") {      // what macOS currently allows Purrload to do
+        if CommandLine.arguments.contains("--notify-status") {
             let done = DispatchSemaphore(value: 0)
             UNUserNotificationCenter.current().getNotificationSettings { s in
                 let names = [0: "not decided", 1: "denied", 2: "allowed", 3: "provisional", 4: "ephemeral"]

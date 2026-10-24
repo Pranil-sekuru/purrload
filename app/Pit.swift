@@ -86,7 +86,6 @@ struct PitScene: View {
 
     // MARK: geometry
 
-    /// Where the card splashes into the lava.
     static func pitCentre(_ e: PitEffect, size: CGSize, floor: CGFloat) -> CGPoint {
         let y = size.height - floor + 4         // at the surface: half-submerged on impact, then it sinks
         let drift = (rnd(e.id.hashValue & 0xffff, 999) - 0.5) * 120
@@ -112,7 +111,6 @@ struct PitScene: View {
         return y
     }
 
-    /// How open the pit is (0...1): opens as the card leaves, closes after the embers.
     static func openness(_ e: PitEffect, _ s: Double) -> Double {
         let open = min(1, max(0, s / 0.35))
         let close = min(1, max(0, (e.end - s) / 0.45))
@@ -167,7 +165,6 @@ struct PitScene: View {
 
     // MARK: drawing
 
-    /// The lava rises while any card is falling and sinks once the last one is done.
     static func lavaLevel(_ effects: [PitEffect], now: Date) -> Double {
         effects.map { openness($0, now.timeIntervalSince($0.born)) }.max() ?? 0
     }
@@ -373,7 +370,7 @@ final class Pit {
         p.backgroundColor = .clear
         p.isOpaque = false
         p.hasShadow = false
-        p.ignoresMouseEvents = true          // never in the way of a click
+        p.ignoresMouseEvents = true
         p.hidesOnDeactivate = false
         let host = NSHostingView(rootView: PitScene(model: model))
         host.sizingOptions = []
@@ -382,7 +379,6 @@ final class Pit {
         return p
     }
 
-    /// Remove finished effects; close the overlay when nothing is left.
     func reap() {
         let now = Date()
         model.effects.removeAll { now.timeIntervalSince($0.born) > $0.end }
@@ -394,7 +390,6 @@ final class Pit {
     }
 }
 
-/// A picture of a row to drop into the pit.
 @MainActor
 func pitCard(for job: Job, title: String, model: Model, width: CGFloat, dark: Bool) -> NSImage? {
     let view = Row(model: model, job: job, title: title)
@@ -407,7 +402,6 @@ func pitCard(for job: Job, title: String, model: Model, width: CGFloat, dark: Bo
     return r.nsImage
 }
 
-/// "Remove animation" choices for the right-click menu.
 struct PitMenu: View {
     var body: some View {
         Menu("Remove animation") {

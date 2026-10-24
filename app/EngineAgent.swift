@@ -1,8 +1,5 @@
-// How the engine runs. Either launchd keeps it going (starts at login, restarts it if it stops: the user turns this
-// on), or Purrload runs it only while the app is open and stops it on quit. Either way it runs from inside the signed
-// app, never from a copy somewhere writable, and the app checks its own signature before letting it run.
-// Right-click → Background engine has the switches and Uninstall. scripts/install-engine-agent.sh is the same agent
-// for a checkout; its --remove undoes either.
+// The engine runs either under launchd (opt-in: starts at login, restarted if it stops) or as the app's child
+// while the app is open. Always from inside the signed app, and only if the app's signature is intact.
 import SwiftUI
 import AppKit
 import ServiceManagement
@@ -16,7 +13,7 @@ struct AgentError: LocalizedError {
 enum EngineAgent {
     static let label = "io.github.pranil-sekuru.purrload-engine"
     static let python = "/usr/bin/python3"
-    static let path = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"   // where aria2 usually lives
+    static let path = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
     static var plistURL: URL {
         FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/LaunchAgents/\(label).plist")
@@ -25,7 +22,7 @@ enum EngineAgent {
     static var isInstalled: Bool { FileManager.default.fileExists(atPath: plistURL.path) }
     static var opensAtLogin: Bool { SMAppService.mainApp.status == .enabled }
 
-    /// The engine the installed agent runs (older versions ran a copy in Application Support).
+    /// Older versions ran a copy in Application Support.
     static var installedEnginePath: String? {
         guard let d = try? Data(contentsOf: plistURL),
               let p = try? PropertyListSerialization.propertyList(from: d, format: nil) as? [String: Any] else { return nil }
@@ -77,26 +74,26 @@ enum EngineAgent {
         return (p.terminationStatus, String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines))
     }
 
-    /// Ask every engine to stop (each saves its downloads first) and wait; aria2 can be slow to let go of a USB drive.
+    /// Waits, because aria2 can be slow to let go of a USB drive.
     static func stopEngines() {
         run("/usr/bin/pkill", ["-TERM", "-f", "purrload-engine.py"])
         for _ in 0..<60 where run("/usr/bin/pgrep", ["-f", "purrload-engine.py"]).status == 0 { Thread.sleep(forTimeInterval: 1) }
     }
 
-    /// Takes a while (it waits for the running engine to stop), so call it off the main thread.
+    /// Slow: call it off the main thread.
     static func install(base: URL) throws {
         let engine = try engine()
         try FileManager.default.createDirectory(at: plistURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         try plistData(base: base, engine: engine).write(to: plistURL, options: .atomic)
         let domain = "gui/\(getuid())"
-        run("/bin/launchctl", ["bootout", "\(domain)/\(label)"])         // an earlier copy of this agent, if any
-        stopEngines()                                                    // one the app runs, or one started by hand
+        run("/bin/launchctl", ["bootout", "\(domain)/\(label)"])
+        stopEngines()
         let r = run("/bin/launchctl", ["bootstrap", domain, plistURL.path])
         if r.status != 0 { throw AgentError("launchctl said: \(r.out)") }
         try? FileManager.default.removeItem(at: base.appendingPathComponent("engine"))   // the copy older versions ran
     }
 
-    /// Off: launchd stops the engine (it saves its downloads) and forgets it. Call it off the main thread.
+    /// Slow: call it off the main thread.
     static func remove() {
         run("/bin/launchctl", ["bootout", "gui/\(getuid())/\(label)"])
         try? FileManager.default.removeItem(at: plistURL)
@@ -127,7 +124,6 @@ enum EngineAgent {
         if (try? p.run()) != nil { child = p }    // if an engine is already running, this one exits at once (its lock)
     }
 
-    /// On quit: SIGTERM, so it saves its downloads and stops aria2.
     static func stopWithApp() {
         child?.terminate()
         child = nil
@@ -138,8 +134,7 @@ enum EngineAgent {
     nonisolated(unsafe) static var working = false
     nonisolated(unsafe) static var warnedTampered = false
 
-    /// At launch and every 30 s: run the engine the right way, and point an old agent at this app's engine
-    /// (that restarts the engine, so only when nothing is downloading).
+    /// Re-pointing an old agent restarts the engine, so it waits until nothing is downloading.
     @MainActor
     static func maintain(model: Model) {
         guard !working else { return }
@@ -163,8 +158,7 @@ enum EngineAgent {
         }
     }
 
-    /// Remove everything Purrload added outside its own folder, its settings and saved list, then the app itself.
-    /// Downloaded files are left alone. Call it off the main thread.
+    /// Downloaded files are left alone. Slow: call it off the main thread.
     static func uninstall(base: URL) {
         remove()
         try? SMAppService.mainApp.unregister()
@@ -175,8 +169,7 @@ enum EngineAgent {
 
 @MainActor
 enum EngineAgentPrompt {
-    /// Ask once whether to run on its own: the engine as a launchd agent, the app as a login item.
-    /// After a "Not now" it asks again only if the engine isn't running.
+    /// Asks once; after "Not now" the right-click menu is the way to turn it on.
     static func askIfNeeded(model: Model) {
         let needAgent = !EngineAgent.isInstalled, needApp = !EngineAgent.opensAtLogin
         guard needAgent || needApp, EngineAgent.bundledEngine != nil, EngineAgent.appIsIntact else { return }
@@ -258,7 +251,6 @@ enum EngineAgentPrompt {
     }
 }
 
-/// Right-click → Background engine.
 struct EngineMenu: View {
     @ObservedObject var model: Model
     var body: some View {

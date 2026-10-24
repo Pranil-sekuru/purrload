@@ -1,5 +1,5 @@
 #!/bin/zsh
-# Start the Purrload engine in the background (it keeps running after the terminal closes).
+# Start the engine by hand. It dies with the app or terminal that started it; the launchd agent doesn't.
 # It reads Safari's download list, so the terminal you start it from needs Full Disk Access.
 ENGINE="${0:A:h}/../engine/purrload-engine.py"
 if pgrep -f "purrload-engine.py" >/dev/null; then echo "Purrload engine is already running."; exit 0; fi

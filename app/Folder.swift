@@ -1,6 +1,4 @@
-// Choosing where downloads go: a little cat-folder chip in the open notch/bar. Click it for recent folders
-// or "Choose another folder…". The choice is saved for the engine in settings.json (read for every new
-// download); a torrent can also be sent somewhere else from its file picker.
+// The cat-folder chip that picks where downloads go; saved for the engine in settings.json.
 import SwiftUI
 import AppKit
 
@@ -21,7 +19,6 @@ extension Model {
 
     var recentFolders: [String] { UserDefaults.standard.stringArray(forKey: "recentFolders") ?? [Model.defaultFolder] }
 
-    /// Tell the engine where to save (it reads this for every new download).
     func writeSettings() {
         guard let data = try? JSONSerialization.data(withJSONObject: ["downloadFolder": downloadFolder]) else { return }
         try? data.write(to: base.appendingPathComponent("settings.json"), options: .atomic)
@@ -76,7 +73,6 @@ enum Folders {
     }
 }
 
-/// The little menu behind the chip.
 @MainActor
 final class FolderMenu: NSObject {
     static let shared = FolderMenu()
