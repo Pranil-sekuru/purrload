@@ -320,7 +320,7 @@ class DirectJob:
 
     def stall(self, gateway, now):
         """Why the speed is 0, for the app; None while moving or only briefly at 0."""
-        if self.state != "downloading" or self.speed() > 0:
+        if self.state != "downloading" or self.speed() > 0 or os.path.exists(PAUSE):
             self.zero_since = None
             return None
         self.zero_since = getattr(self, "zero_since", None) or now
@@ -330,7 +330,9 @@ class DirectJob:
         if gateway is None:
             return "No internet · carries on when it's back"
         r = self.run
-        if r and r.parsed and r.alive() and now - r.heard >= 3:
+        if not (r and r.alive()):       # between restarts its peer counts are stale
+            return None
+        if r.parsed and now - r.heard >= 3:
             slow = filesystem(self.folder) in ("exfat", "msdos", "vfat")
             return "Waiting on the drive" + (" · slow USB disk, normal" if slow else " · it's busy writing")
         if self.torrent and r and r.conns == 0:
