@@ -614,7 +614,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         closedFit = measureClosed.fittingSize
     }
 
-    func notchWindowSize() -> CGSize { CGSize(width: NotchMetrics.openWidth + 40, height: openFit.height + 8) }
+    /// Wide enough for the widest the strip ever gets (open, or widened to show a message), so its ends are never cut off.
+    func notchWindowSize() -> CGSize {
+        let widest = max(NotchMetrics.openWidth, notch?.closedWidth(flashing: true) ?? 0)
+        return CGSize(width: widest + 40, height: openFit.height + 8)
+    }
 
     /// The window only resizes when the open layout's height changes (downloads added/removed), never on open/close.
     func resizeToFit() {
@@ -623,8 +627,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let f = p.frame
         if mode == "notch", let screen = notchScreen {
             let size = notchWindowSize()
-            guard abs(size.height - f.height) > 0.5 else { return }
-            p.setFrame(NSRect(x: f.minX, y: screen.frame.maxY - size.height, width: size.width, height: size.height), display: true)
+            guard abs(size.height - f.height) > 0.5 || abs(size.width - f.width) > 0.5 else { return }
+            p.setFrame(NSRect(x: screen.frame.midX - size.width / 2, y: screen.frame.maxY - size.height,   // stays centred on the notch
+                              width: size.width, height: size.height), display: true)
         } else {
             guard abs(openFit.height - f.height) > 0.5 || abs(openFit.width - f.width) > 0.5 else { return }
             p.setFrame(NSRect(x: f.minX, y: bottom, width: openFit.width, height: openFit.height), display: true)
@@ -747,6 +752,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             checks += results.map { ($0.0, .zero, true) }   // count them in the total
             if model.expanded { model.toggle() }
             try? await Task.sleep(for: .seconds(0.6))
+        }
+
+        if let m = notch {      // nothing may be cut off by the window's edges, in any state
+            let w = p.frame.width
+            for (label, width) in [("closed", m.closedWidth(flashing: false)), ("widened for a message", m.closedWidth(flashing: true)),
+                                   ("open", NotchMetrics.openWidth)] {
+                let ok = width <= w - 2
+                pass += ok ? 1 : 0
+                checks.append((label, .zero, true))
+                lines.append(String(format: "fits in window when %@: %.0f of %.0f pt  %@", label, width, w, ok ? "ok" : "WRONG"))
+            }
         }
 
         // "ready" announcement: widens, then clears itself after ~4s
