@@ -146,7 +146,7 @@ struct NotchView: View {
                 Text(model.series).font(.system(size: 10.5, weight: .semibold)).foregroundStyle(Color.soft)
                     .textCase(.uppercase).tracking(0.6).padding(.bottom, -5)
             }
-            ForEach(model.jobs) { Row(job: $0, title: model.rowTitle($0)) }
+            ForEach(model.jobs) { Row(model: model, job: $0, title: model.rowTitle($0)) }
             HStack(spacing: 16) {
                 Button(model.status?.paused == true ? "Resume" : "Pause") { model.togglePause() }
                 Button("Open folder") { model.openFolder() }

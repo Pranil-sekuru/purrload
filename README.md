@@ -18,7 +18,9 @@ Purrload keeps your Safari downloads alive. It stops your Mac from sleeping mid-
 - Drag a link, magnet link or `.torrent` file onto the notch: the strip opens wide to say "Drop to download", and the kitty gets ready to catch it.
 - Copy a download link (a magnet, or a web link to a `.mkv`, `.zip`, `.dmg`, …) and the notch offers to download it. Ordinary page links are ignored. You can turn this off with a right-click.
 - Web downloads go to `~/Downloads` (8 connections per file with aria2, otherwise curl), with the same resume, retry and network-switch recovery.
-- Torrents automatically follow the safe path: fetch the file list, download only video, audio and subtitles, check the contents, and add the quarantine mark.
+- **Pick what you want from a torrent.** Before anything downloads, the notch shows every file with a tick box. Video, audio and subtitles are ticked for you, extras like posters or `.nfo` files can be added, and anything the safety check flags (disguised apps, `.exe` files, double extensions) is locked with the reason shown.
+- After downloading, torrents are checked again by content and get the quarantine mark.
+- Finished downloads get **Show in Finder**, failed ones get **Retry**, and both can be cleared with **Remove**.
 
 **A kitty with moods**
 - It hops and sparkles when downloads are fast, and looks worried (with a sweat drop) when they stall or the network drops.
@@ -109,7 +111,7 @@ The stress test opens and closes the notch or bar 60 times like real clicks, at 
 
 - Safari extension: "Download with Purrload" in the right-click menu (needs Xcode)
 - Register as the handler for `magnet:` links and `.torrent` files, so clicking them in Safari opens Purrload
-- Per-download pause, cancel and "show in Finder"
+- Pause and cancel for individual downloads while they're running
 - Swift download engine built on aria2's remote-control (JSON-RPC) interface, replacing the Python engine
 - Settings window: download folder, connections, speed limit, auto-pause on mobile hotspot data
 - Signed and notarized releases, Homebrew cask, automatic updates

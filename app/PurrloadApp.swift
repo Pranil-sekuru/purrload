@@ -17,9 +17,25 @@ struct Job: Decodable, Identifiable {
     let eta: Double?
     let folder: String
     var message: String? = nil
+    var files: [TorrentFile]? = nil     // torrents waiting for the user to choose
+    var canRetry: Bool? = nil
+    var path: String? = nil             // finished: what "Show in Finder" selects
 
     var fraction: Double { total > 0 ? min(done / total, 1) : 0 }
     var active: Bool { ["downloading", "takeover", "failed", "starting", "metadata"].contains(state) }
+}
+
+struct TorrentFile: Decodable, Identifiable {
+    let index: Int
+    let path: String
+    let size: Double
+    let kind: String          // media / subtitle / other
+    let flags: [String]
+    let blocked: Bool         // flagged by the safety check: can't be picked
+    let preselect: Bool
+
+    var id: Int { index }
+    var fileName: String { (path as NSString).lastPathComponent }
 }
 
 struct Status: Decodable {
@@ -35,12 +51,24 @@ nonisolated(unsafe) var useDemoData = false   // --demo: made-up downloads for s
 let demoStatus: Status = {
     let gb = 1_073_741_824.0, now = Date().timeIntervalSince1970, dir = NSTemporaryDirectory()
     func job(_ title: String, _ done: Double, _ total: Double, _ speed: Double, _ state: String = "takeover") -> Job {
+        // (a var so callers can add files/messages)
         Job(id: title, name: title, title: "Blender Open Movies \(title)", state: state, done: done * gb, total: total * gb,
             speed: speed * 1_048_576, eta: speed > 0 ? (total - done) * gb / (speed * 1_048_576) : nil, folder: dir)
     }
+    let mb = 1_048_576.0
+    func f(_ i: Int, _ path: String, _ size: Double, _ kind: String, _ flags: [String] = [], blocked: Bool = false) -> TorrentFile {
+        TorrentFile(index: i, path: path, size: size, kind: kind, flags: flags, blocked: blocked, preselect: kind != "other" && !blocked)
+    }
+    var choosing = job("Cosmos Laundromat", 0, 0, 0, "choosing")
+    choosing.files = [f(1, "Cosmos.Laundromat.2015.1080p.mkv", 1210 * mb, "media"), f(2, "Cosmos.Laundromat.en.srt", 0.05 * mb, "subtitle"),
+                      f(3, "Cosmos.Laundromat.de.srt", 0.05 * mb, "subtitle"), f(4, "poster.jpg", 0.4 * mb, "other"),
+                      f(5, "Extras/Codec Setup.zip", 2 * mb, "other", ["archive: can hide anything"]),
+                      f(6, "Cosmos Laundromat Player.exe", 3 * mb, "other", [".exe file: not a media file"], blocked: true)]
+    var failed = job("Spring", 0.2, 0.3, 0, "corrupt")
+    failed.message = "download kept failing; drop the link again to retry"; failed.canRetry = true
     return Status(updated: now, speed: 4.6 * 1_048_576, paused: false, jobs: [
         job("Sintel 4K", 1.6, 2.5, 1.9), job("Tears of Steel 4K", 0.9, 2.2, 1.4),
-        job("Elephants Dream", 0.8, 0.9, 1.3), job("Big Buck Bunny 4K", 1.4, 1.4, 0, "verified"),
+        choosing, job("Big Buck Bunny 4K", 1.4, 1.4, 0, "verified"), failed,
     ])
 }()
 
@@ -62,6 +90,7 @@ final class Model: ObservableObject {
         get { UserDefaults.standard.object(forKey: "watchClipboard") as? Bool ?? true }
         set { UserDefaults.standard.set(newValue, forKey: "watchClipboard"); objectWillChange.send() }
     }
+    @Published var picks: [String: Set<Int>] = [:]   // torrent file choices, per job
     // kitty moods
     var caughtAt = Date.distantPast, celebrateAt = Date.distantPast, alertAt = Date.distantPast
     var slowSince: Date?
@@ -88,6 +117,7 @@ final class Model: ObservableObject {
             let old = lastStates[j.id]
             if let old, old != "verified", j.state == "verified" { announce("\(j.name) ready") }   // passed its check
             if old != "danger", j.state == "danger" { alertAt = Date(); announce("⚠ \(j.name) flagged") }
+            if old != "choosing", j.state == "choosing" { announce("Choose files: \(j.name.prefix(16))") }
             lastStates[j.id] = j.state
         }
         status = s
@@ -167,6 +197,43 @@ final class Model: ObservableObject {
         load()
     }
 
+    // MARK: torrent file picker
+
+    func selection(for j: Job) -> Set<Int> {
+        picks[j.id] ?? Set((j.files ?? []).filter(\.preselect).map(\.index))
+    }
+    func togglePick(_ f: TorrentFile, in j: Job) {
+        guard !f.blocked else { return }
+        var s = selection(for: j)
+        if s.contains(f.index) { s.remove(f.index) } else { s.insert(f.index) }
+        picks[j.id] = s
+    }
+    func pick(_ j: Job, _ filter: (TorrentFile) -> Bool) {
+        picks[j.id] = Set((j.files ?? []).filter { !$0.blocked && filter($0) }.map(\.index))
+    }
+    func pickedBytes(_ j: Job) -> Double {
+        let s = selection(for: j)
+        return (j.files ?? []).filter { s.contains($0.index) }.reduce(0) { $0 + $1.size }
+    }
+    func startTorrent(_ j: Job) {
+        let s = selection(for: j).sorted()
+        guard !s.isEmpty, send(["select": j.id, "files": s]) else { return }
+        caughtAt = Date()
+        announce("Downloading \(s.count) file\(s.count == 1 ? "" : "s")")
+    }
+
+    // MARK: row actions
+
+    func retry(_ j: Job) { if send(["retry": j.id]) { caughtAt = Date() } }
+    func remove(_ j: Job) { _ = send(["remove": j.id]); picks[j.id] = nil }
+    func reveal(_ j: Job) {
+        if let p = j.path, FileManager.default.fileExists(atPath: p) {
+            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: p)])
+        } else {
+            NSWorkspace.shared.open(URL(fileURLWithPath: j.folder))
+        }
+    }
+
     func openFolder() {
         let folder = jobs.first?.folder ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Downloads").path
         NSWorkspace.shared.open(URL(fileURLWithPath: folder))
@@ -195,7 +262,9 @@ extension Color {
 // MARK: - Formatting
 
 func gb(_ b: Double) -> String {
-    b >= 1_073_741_824 ? String(format: "%.1f GB", b / 1_073_741_824) : String(format: "%.0f MB", b / 1_048_576)
+    if b >= 1_073_741_824 { return String(format: "%.1f GB", b / 1_073_741_824) }
+    if b >= 1_048_576 { return String(format: "%.0f MB", b / 1_048_576) }
+    return String(format: "%.0f KB", max(1, b / 1024))
 }
 func mbs(_ b: Double) -> String { String(format: "%.1f MB/s", b / 1_048_576) }
 func left(_ s: Double?) -> String {
@@ -239,6 +308,7 @@ struct Line: View {
 }
 
 struct Row: View {
+    @ObservedObject var model: Model
     let job: Job
     let title: String
     var body: some View {
@@ -252,6 +322,8 @@ struct Row: View {
             }
             Line(fraction: job.fraction, color: lineColor)
             Text(caption).font(.system(size: 10.5).monospacedDigit()).foregroundStyle(Color.soft)
+            if job.state == "choosing" { FilePicker(model: model, job: job).padding(.top, 3) }
+            else { RowActions(model: model, job: job) }
         }
     }
 
@@ -266,11 +338,12 @@ struct Row: View {
     var caption: String {
         switch job.state {
         case "verified": return "Ready · \(gb(job.total)) · checked ✓"
-        case "corrupt":  return "Failed the check, needs re-downloading"
+        case "corrupt":  return job.message ?? "Failed the check, needs re-downloading"
         case "expired":  return "Link expired, get a fresh one from the site"
         case "starting": return "Getting file info…"
         case "metadata": return "Asking peers for the file list…"
         case "skipped":  return job.message ?? "Skipped"
+        case "choosing": return "\(job.files?.count ?? 0) files · pick what to download"
         case "danger":   return "⚠ " + (job.message ?? "Flagged by the safety check: don't open it")
         default:
             return "\(gb(job.done)) of \(gb(job.total)) · \(mbs(job.speed)) · \(left(job.eta))"
@@ -330,7 +403,7 @@ struct BarView: View {
                         Text(model.series).font(.system(size: 10.5, weight: .semibold)).foregroundStyle(Color.soft)
                             .textCase(.uppercase).tracking(0.6).padding(.bottom, -5)
                     }
-                    ForEach(model.jobs) { Row(job: $0, title: model.rowTitle($0)) }
+                    ForEach(model.jobs) { Row(model: model, job: $0, title: model.rowTitle($0)) }
                 }
                 .padding(.horizontal, 14)
 
@@ -713,7 +786,7 @@ func snapshotNotch(to path: String) {
                     .fill(.black).frame(width: m.notchWidth, height: m.height)
                 NotchView(model: x, metrics: m, kittyAt: now, measuring: open)
             }
-            .frame(width: 560, height: open ? 470 : 70)
+            .frame(width: 560, height: open ? 880 : 70)
             .clipped()
             Text(label).font(.system(size: 12, weight: .semibold)).foregroundStyle(.white)
         }
@@ -750,7 +823,7 @@ func snapshotNotch(to path: String) {
             }
             VStack(spacing: 20) {
                 scene("open", model(expanded: true, toggled: 1.3), open: true)
-                scene("open, with a copied link", { let x = model(expanded: true, toggled: 9); x.offer = "https://example.com/films/Cosmos.Laundromat.mkv"; return x }(), open: true)
+
             }
         }
     }
@@ -800,11 +873,44 @@ func selftest(to path: String) {
     check("no half-written temp files left behind",
           ((try? FileManager.default.contentsOfDirectory(atPath: tmp.path)) ?? []).allSatisfy { !$0.hasPrefix(".inbox-") })
     check("kitty catches the link", Date().timeIntervalSince(m.caughtAt) < 1)
+    // torrent file picker
+    let pickerJSON = """
+    {"updated": 0, "speed": 0, "paused": false, "jobs": [{"id": "t1", "name": "Show", "title": "Show", "state": "choosing",
+     "done": 0, "total": 0, "speed": 0, "eta": null, "folder": "/tmp", "canRetry": false, "files": [
+      {"index": 1, "path": "Show.E01.mkv", "size": 900, "kind": "media", "flags": [], "blocked": false, "preselect": true},
+      {"index": 2, "path": "Show.E01.srt", "size": 10, "kind": "subtitle", "flags": [], "blocked": false, "preselect": true},
+      {"index": 3, "path": "cover.jpg", "size": 50, "kind": "other", "flags": [], "blocked": false, "preselect": false},
+      {"index": 4, "path": "Show.E02.mkv.exe", "size": 5, "kind": "other", "flags": ["double extension"], "blocked": true, "preselect": false}]},
+     {"id": "w1", "name": "x", "title": "x", "state": "corrupt", "done": 0, "total": 0, "speed": 0, "eta": null,
+      "folder": "/tmp", "canRetry": true, "message": "kept failing"}]}
+    """
+    let st = try? JSONDecoder().decode(Status.self, from: Data(pickerJSON.utf8))
+    check("status with a file list decodes", st?.jobs.first?.files?.count == 4)
+    if let st, let tj = st.jobs.first, let files = tj.files {
+        m.status = st
+        check("media and subtitles are ticked by default, extras aren't", m.selection(for: tj) == [1, 2])
+        m.togglePick(files[3], in: tj)
+        check("a locked file can't be ticked", !m.selection(for: tj).contains(4))
+        m.togglePick(files[2], in: tj)
+        check("ticking an extra adds it", m.selection(for: tj) == [1, 2, 3])
+        check("selected size adds up", m.pickedBytes(tj) == 960)
+        m.pick(tj) { $0.kind != "other" }
+        check("'Media only' resets to media + subtitles", m.selection(for: tj) == [1, 2])
+        m.pick(tj) { _ in true }
+        check("'All safe files' never includes a locked file", m.selection(for: tj) == [1, 2, 3])
+        let before = Set((try? FileManager.default.contentsOfDirectory(atPath: inbox.path)) ?? [])
+        m.startTorrent(tj)
+        m.retry(st.jobs[1]); m.remove(st.jobs[1])
+        let added = Set((try? FileManager.default.contentsOfDirectory(atPath: inbox.path)) ?? []).subtracting(before)
+        let msgs = added.compactMap { try? JSONSerialization.jsonObject(with: Data(contentsOf: inbox.appendingPathComponent($0))) as? [String: Any] }
+        check("Download sends the picked files", msgs.contains { ($0["select"] as? String) == "t1" && ($0["files"] as? [Int]) == [1, 2, 3] })
+        check("Retry and Remove send their requests", msgs.contains { $0["retry"] as? String == "w1" } && msgs.contains { $0["remove"] as? String == "w1" })
+    }
     m.offer = "magnet:?xt=urn:btih:abc"; m.offerAt = Date()
     check("offer widens the strip", m.wide)
     m.acceptOffer()
     check("accepting the offer queues it and clears it", m.offer == nil &&
-          (((try? FileManager.default.contentsOfDirectory(atPath: inbox.path)) ?? []).count == 2))
+          (((try? FileManager.default.contentsOfDirectory(atPath: inbox.path)) ?? []).count == 5))   // link + select + retry + remove + offer
     try? FileManager.default.removeItem(at: tmp)
     lines += ["", "TOTAL \(pass)/\(total)"]
     try? lines.joined(separator: "\n").write(toFile: path, atomically: true, encoding: .utf8)

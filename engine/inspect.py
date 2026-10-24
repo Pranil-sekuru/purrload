@@ -2,6 +2,7 @@
 """Torrent safety checks.
 
   inspect.py plan  <file.torrent> [all]  -> stdout: torrent name, aria2 --select-file list, selected bytes
+  inspect.py files <file.torrent>        -> stdout: JSON file list for the app's picker
   inspect.py check <path>                -> quarantine every file, report anything that isn't plain media
 
 Only reads file bytes; never opens or runs anything it inspects.
@@ -75,24 +76,42 @@ def human(n):
             return f"{n:.0f} {u}" if u == "B" else f"{n:.1f} {u}"
         n /= 1024
 
-def plan(torrent, take_all):
+def torrent_files(torrent):
+    """(name, [(path, size), ...]) in aria2's --select-file order (1-based)."""
     info = bdecode(open(torrent, "rb").read())[0][b"info"]
     name = txt(info.get(b"name.utf-8", info[b"name"]))
     if b"files" in info:
-        files = [("/".join(txt(p) for p in f.get(b"path.utf-8", f[b"path"])), f[b"length"]) for f in info[b"files"]]
-    else:
-        files = [(name, info[b"length"])]
+        return name, [("/".join(txt(p) for p in f.get(b"path.utf-8", f[b"path"])), f[b"length"]) for f in info[b"files"]]
+    return name, [(name, info[b"length"])]
+
+def assess(path, size):
+    """(kind, flags, blocked, preselect) for one file in a torrent."""
+    e = ext(path)
+    kind = "media" if e in MEDIA else "subtitle" if e in SUBS else "other"
+    flags = name_flags(path)
+    if kind == "media" and size < 1_000_000:
+        flags.append(("AMBER", "tiny for a video; could be a fake"))
+    blocked = any(lvl == "RED" for lvl, _ in flags)
+    return kind, flags, blocked, kind != "other" and not blocked
+
+def files_json(torrent):
+    """For the app's file picker: every file with its kind, warnings, and whether it's blocked or ticked by default."""
+    name, files = torrent_files(torrent)
+    out = []
+    for idx, (path, size) in enumerate(files, 1):
+        kind, flags, blocked, pre = assess(path, size)
+        out.append({"index": idx, "path": path, "size": size, "kind": kind,
+                    "flags": [m for _, m in flags], "blocked": blocked, "preselect": pre})
+    print(json.dumps({"name": name, "files": out}))
+
+def plan(torrent, take_all):
+    name, files = torrent_files(torrent)
 
     sel, red, sel_bytes = [], 0, 0
     out = sys.stderr
     print(f"\nTorrent: {name}   ({len(files)} files, {human(sum(s for _, s in files))})\n", file=out)
     for idx, (path, size) in enumerate(files, 1):
-        flags = name_flags(path)
-        e = ext(path)
-        wanted = e in MEDIA or e in SUBS
-        if wanted and size < 1_000_000 and e in MEDIA:
-            flags.append(("AMBER", "tiny for a video; could be a fake"))
-        is_red = any(lvl == "RED" for lvl, _ in flags)
+        kind, flags, is_red, wanted = assess(path, size)
         red += is_red
         take = take_all == "2" or (wanted and not is_red) or (take_all == "1" and not is_red)
         if take:
@@ -190,6 +209,8 @@ def check(root):
 if __name__ == "__main__":
     if len(sys.argv) >= 3 and sys.argv[1] == "plan":
         plan(sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else "0")
+    elif len(sys.argv) == 3 and sys.argv[1] == "files":
+        files_json(sys.argv[2])
     elif len(sys.argv) == 3 and sys.argv[1] == "check":
         check(os.path.abspath(sys.argv[2]))
     else:

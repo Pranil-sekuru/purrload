@@ -40,18 +40,27 @@ enum Links {
 }
 
 extension Model {
-    /// Queue a link for the engine (write to a temp file, then move it in, so the engine never reads half a file).
-    func enqueue(_ link: String) {
+    /// Send a request to the engine: {"url"}, {"select", "files"}, {"retry"} or {"remove"}.
+    /// Written to a temp file and moved into the inbox, so the engine never reads half a file.
+    @discardableResult
+    func send(_ request: [String: Any]) -> Bool {
         let fm = FileManager.default
         let inbox = base.appendingPathComponent("inbox")
         try? fm.createDirectory(at: inbox, withIntermediateDirectories: true)
         let tmp = base.appendingPathComponent(".inbox-\(UUID().uuidString)")
         let file = inbox.appendingPathComponent("\(Int(Date().timeIntervalSince1970 * 1000))-\(UUID().uuidString.prefix(8)).json")
-        guard let data = try? JSONSerialization.data(withJSONObject: ["url": link]),
+        guard let data = try? JSONSerialization.data(withJSONObject: request),
               (try? data.write(to: tmp)) != nil, (try? fm.moveItem(at: tmp, to: file)) != nil else {
-            announce("Couldn't add that")
-            return
+            try? fm.removeItem(at: tmp)
+            announce("Couldn't reach the engine")
+            return false
         }
+        return true
+    }
+
+    /// Queue a link for the engine.
+    func enqueue(_ link: String) {
+        guard send(["url": link]) else { return }
         caughtAt = Date()
         let name = Links.displayName(link)
         announce(guardRunning ? "Added \(name.prefix(22))" : "Queued, engine is off")

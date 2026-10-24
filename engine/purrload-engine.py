@@ -211,7 +211,12 @@ class DirectJob:
         self.folder = os.path.join(DOWNLOADS, "Torrents") if self.torrent else DOWNLOADS
         self.name = self.title = "Magnet link" if url.startswith("magnet:") else (
             os.path.basename(urlparse(url).path) or "download")
-        self.state = "starting"          # starting -> metadata (magnets) -> downloading -> verified | corrupt | danger
+        self.state = "starting"          # starting -> metadata (magnets) -> choosing (torrents) -> downloading -> verified | corrupt | danger
+        self.files = None                # torrents: the file list shown in the app's picker
+        self.selection = None            # torrents: file indices the user picked
+        self.chosen = threading.Event()  # set when the user picks files, or removes the job
+        self.removed = False
+        self.path = None                 # finished: what to show in Finder
         self.message = ""
         self.total = 0
         self.run = None                  # current Runner
@@ -291,7 +296,7 @@ class DirectJob:
         quarantine(self.part)
         os.rename(self.part, final)
         self.part, self.total, self.state = None, size, "verified"
-        self.message = os.path.basename(final)
+        self.message, self.path = os.path.basename(final), final
         notify("Download complete", f"{self.name} ({fmt_bytes(size)})")
 
     def work_torrent(self):
@@ -323,17 +328,30 @@ class DirectJob:
             if not found:
                 return self.fail("no peers sent the file list; try again later")
             tor = os.path.join(work, found[0])
-        plan = subprocess.run([sys.executable, "-I", INSPECT, "plan", tor, "0"], capture_output=True, text=True)
-        if plan.returncode == 2:                     # the planner's "nothing safe to download" answer
-            return self.fail("skipped: no video, audio or subtitles in it", "skipped")
-        if plan.returncode != 0:                     # anything else is a real error: say so, don't call it "no media"
-            err = (plan.stderr.strip().splitlines() or ["unknown error"])[-1]
-            return self.fail(f"couldn't read the torrent: {err[:100]}")
-        name, sel, size = plan.stdout.strip().split("\n")[-3:]
-        self.set_name(name)
-        self.total = int(size)
+        listing = subprocess.run([sys.executable, "-I", INSPECT, "files", tor], capture_output=True, text=True)
+        if listing.returncode != 0:                  # a real error: say so, don't call it "no media"
+            err = (listing.stderr.strip().splitlines() or ["unknown error"])[-1]
+            log(f"{self.name}: torrent listing failed: {err[:200]}")
+            return self.fail("couldn't read it: it may be damaged, or not a .torrent file")
+        info = json.loads(listing.stdout)
+        name, self.files = info["name"], info["files"]
+        self.set_name(name)                          # the real name, as soon as we know it
+        if all(f["blocked"] for f in self.files):
+            return self.fail("every file in it was flagged by the safety check", "danger")
+        self.state = "choosing"                      # wait for the user to pick files in the app
+        log(f"{self.name}: {len(self.files)} files, waiting for the user to choose")
+        self.chosen.wait()
+        if self.removed:
+            return
+        allowed = {f["index"] for f in self.files if not f["blocked"]}
+        picked = sorted(i for i in (self.selection or []) if i in allowed)   # never download a blocked file
+        if not picked:
+            return self.fail("nothing was selected")
+        sel = ",".join(map(str, picked))
+        self.total = sum(f["size"] for f in self.files if f["index"] in picked)
+        self.files = None
         self.state = "downloading"
-        log(f"{self.name}: torrent, fetching media files {sel}")
+        log(f"{self.name}: torrent, fetching {len(picked)} chosen file(s)")
         make = lambda: [ARIA2, "-d", self.folder, "-T", tor, f"--select-file={sel}", "--bt-remove-unselected-file=true",
                         "-c", "--file-allocation=none", "--seed-time=0", "--max-tries=0", "--retry-wait=5",
                         "--console-log-level=error", "--summary-interval=0"]
@@ -343,14 +361,15 @@ class DirectJob:
                                capture_output=True, text=True)
         if check.returncode == 1:
             return self.fail("the safety check flagged files in it: don't open them", "danger")
-        self.state, self.message = "verified", name
-        notify("Download complete", f"{self.name}: checked, only media inside")
+        self.state, self.message, self.path = "verified", name, os.path.join(self.folder, name)
+        notify("Download complete", f"{self.name}: checked, nothing suspicious inside")
 
 class Engine:
     def __init__(self):
         self.jobs = {}
         self.caff = None
         self.volume_warned = set()
+        self.removed = set()                 # rows the user cleared
         self.gateway = default_gateway()
         self.paused = False
 
@@ -370,7 +389,7 @@ class Engine:
                 continue
             final = os.path.join(os.path.dirname(os.path.dirname(path)), os.path.basename(path))
             orphan = os.path.exists(final + ".part")      # failed in Safari, taken over earlier
-            if jid not in self.jobs and ("DownloadEntryDateFinishedKey" not in e or orphan):
+            if jid not in self.jobs and jid not in self.removed and ("DownloadEntryDateFinishedKey" not in e or orphan):
                 j = Job(e)
                 self.jobs[jid] = j
                 exp = j.expiry.astimezone().strftime("%H:%M") if j.expiry else "unknown"
@@ -528,7 +547,8 @@ class Engine:
                 tot_sp += sp
                 items.append({"id": j.id, "name": j.name, "title": j.title, "state": j.state, "done": size,
                               "total": j.total, "speed": sp, "eta": (j.total - size) / sp if sp > 0 and j.total else None,
-                              "folder": j.folder, "message": j.message})
+                              "folder": j.folder, "message": j.message, "files": j.files if j.state == "choosing" else None,
+                              "canRetry": j.state in ("corrupt", "skipped"), "path": j.path})
                 rows.append(f"{j.name[:8]:8} {j.state:11} {100 * size / j.total if j.total else 0:5.1f}%  "
                             f"{fmt_bytes(size):>9} / {fmt_bytes(j.total):<9} {sp / 1048576:5.2f} MB/s")
                 continue
@@ -540,7 +560,7 @@ class Engine:
             exp = j.expiry.astimezone().strftime("%H:%M") if j.expiry else "-"
             items.append({"id": j.id, "name": j.name, "title": j.title, "state": j.state,
                           "done": size, "total": j.total, "speed": sp, "eta": eta,
-                          "folder": os.path.dirname(j.final)})
+                          "folder": os.path.dirname(j.final), "path": j.final if j.state == "verified" else None})
             rows.append(f"{j.name:8} {j.state:11} {pct:5.1f}%  {fmt_bytes(size):>9} / {fmt_bytes(j.total):<9}"
                         f" {sp/1048576:5.2f} MB/s  ETA {fmt_dur(eta):>7}  link exp {exp}")
         rows += ["", f"total {tot_sp/1048576:.2f} MB/s"]
@@ -561,16 +581,38 @@ class Engine:
         for n in names:
             p = os.path.join(INBOX, n)
             try:
-                url = json.load(open(p))["url"].strip()
+                msg = json.load(open(p))
             except Exception:
-                url = None
+                msg = {}
             os.remove(p)
-            if url and re.match(r"(https?://|magnet:\?)", url) or (url and url.lower().endswith(".torrent") and os.path.exists(url)):
-                j = DirectJob(url)
-                self.jobs[j.id] = j
-                log(f"added a {'torrent' if j.torrent else 'web'} download from the app")
-            elif url:
-                log("ignored an inbox item that isn't a web link, magnet or .torrent file")
+            if "select" in msg:                      # the user's picks for a torrent
+                j = self.jobs.get(msg["select"])
+                if isinstance(j, DirectJob) and j.state == "choosing":
+                    j.selection = [int(i) for i in msg.get("files", [])]
+                    j.chosen.set()
+            elif "retry" in msg:
+                j = self.jobs.get(msg["retry"])
+                if isinstance(j, DirectJob) and j.state in ("corrupt", "skipped"):
+                    del self.jobs[j.id]
+                    n = DirectJob(j.url)
+                    self.jobs[n.id] = n
+                    log(f"{j.name}: retrying")
+            elif "remove" in msg:                    # clear a finished/failed row, or cancel a torrent being chosen
+                j = self.jobs.get(msg["remove"])
+                if j and j.state not in ("downloading", "takeover", "failed", "metadata", "starting"):
+                    if isinstance(j, DirectJob):
+                        j.removed = True
+                        j.chosen.set()
+                    self.removed.add(j.id)
+                    del self.jobs[j.id]
+            elif "url" in msg:
+                url = str(msg["url"]).strip()
+                if re.match(r"(https?://|magnet:\?)", url) or (url.lower().endswith(".torrent") and os.path.exists(url)):
+                    j = DirectJob(url)
+                    self.jobs[j.id] = j
+                    log(f"added a {'torrent' if j.torrent else 'web'} download from the app")
+                else:
+                    log("ignored an inbox item that isn't a web link, magnet or .torrent file")
         return bool(names)
 
     def step_direct(self, j, now):
