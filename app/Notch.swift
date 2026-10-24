@@ -7,7 +7,7 @@ struct NotchMetrics {
     let notchWidth: CGFloat
     let height: CGFloat                       // notch / menu bar height
     static let wing: CGFloat = 64             // black area each side of the notch when closed
-    static let flashWing: CGFloat = 124       // wider while announcing a finished download
+    static let flashWing: CGFloat = 150       // wider while it has something to say
     static let openWidth: CGFloat = 400
     static let shoulder: CGFloat = 8          // concave curve where the shape meets the menu bar
     static let kittySize = CGSize(width: 38, height: 32)   // the small kitty in the right wing
@@ -71,6 +71,7 @@ struct NotchView: View {
         VStack(alignment: .leading, spacing: 0) {
             wings
             if open { details.transition(.opacity) }
+            else if !model.jobs.isEmpty { underNotch }
         }
         .padding(.horizontal, NotchMetrics.shoulder)
         .frame(width: metrics.width(open: open, flashing: flashing), alignment: .top)
@@ -83,6 +84,7 @@ struct NotchView: View {
             Button(model.watchClipboard ? "✓ Offer copied download links" : "Offer copied download links") {
                 model.watchClipboard.toggle()
             }
+            PitMenu()
             Button("Move to corner") { model.switchMode?() }
             Divider()
             Button("Quit") { NSApp.terminate(nil) }
@@ -90,13 +92,19 @@ struct NotchView: View {
     }
 
     // The strip either side of the notch, inside the menu bar.
+    // Each wing gets an exact width and the middle is exactly the notch, so text is shortened inside its
+    // wing instead of sliding under the camera cut-out.
+    var wing: CGFloat { (metrics.width(open: open, flashing: flashing) - metrics.notchWidth) / 2 - NotchMetrics.shoulder }
+
     var wings: some View {
         HStack(spacing: 0) {
             HStack(spacing: 6) {
                 Gem(active: model.isActive)
-                if !open { Text(leftText).lineLimit(1) }     // open: the header below carries the numbers
+                if !open { Text(leftText).lineLimit(1).truncationMode(.tail) }   // open: the header below has the numbers
             }
-            Spacer(minLength: metrics.notchWidth)
+            .padding(.leading, 10).padding(.trailing, 6)
+            .frame(width: wing, alignment: .leading)
+            Color.clear.frame(width: metrics.notchWidth)                          // the camera cut-out
             HStack(spacing: 4) {
                 if flashing && !open { Text(rightText).lineLimit(1).foregroundStyle(rightColor) }
                 KittyView(model: model, frozenAt: measuring != nil ? Date() : kittyAt)
@@ -104,17 +112,20 @@ struct NotchView: View {
                     .frame(width: NotchMetrics.kittySize.width, height: NotchMetrics.kittySize.height)
                     .offset(y: 1)
             }
+            .padding(.leading, 6).padding(.trailing, 4)
+            .frame(width: wing, alignment: .trailing)
         }
         .font(.system(size: 11, weight: .semibold).monospacedDigit())
         .foregroundStyle(Color.white)
-        .padding(.leading, 10).padding(.trailing, 4)
         .frame(height: metrics.height)
-        .overlay(alignment: .bottom) {
-            if !open && !model.jobs.isEmpty {
-                Line(fraction: model.overall, height: 2.5)      // stops short of the kitty
-                    .padding(.leading, 12).padding(.trailing, 12 + NotchMetrics.kittySize.width).padding(.bottom, 3)
-            }
-        }
+        .clipped()
+    }
+
+    // Closed: the strip reaches a few points below the notch, and the progress line runs there,
+    // so the camera cut-out can't hide the middle of it.
+    var underNotch: some View {
+        Line(fraction: model.overall, height: 2.5)
+            .padding(.horizontal, 12).padding(.top, 2).padding(.bottom, 4.5)
     }
 
     var leftText: String {
@@ -146,7 +157,7 @@ struct NotchView: View {
                 Text(model.series).font(.system(size: 10.5, weight: .semibold)).foregroundStyle(Color.soft)
                     .textCase(.uppercase).tracking(0.6).padding(.bottom, -5)
             }
-            ForEach(model.jobs) { Row(model: model, job: $0, title: model.rowTitle($0)) }
+            ForEach(model.jobs) { Row(model: model, job: $0, title: model.rowTitle($0), live: measuring == nil && kittyAt == nil) }
             HStack(spacing: 16) {
                 Button(model.status?.paused == true ? "Resume" : "Pause") { model.togglePause() }
                 Button("Open folder") { model.openFolder() }

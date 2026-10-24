@@ -93,6 +93,10 @@ final class Model: ObservableObject {
         set { UserDefaults.standard.set(newValue, forKey: "watchClipboard"); objectWillChange.send() }
     }
     @Published var picks: [String: Set<Int>] = [:]   // torrent file choices, per job
+    var rowFrames: [String: CGRect] = [:]          // where each row is in the window (for the fiery pit)
+    var toScreen: ((CGRect) -> CGRect)?            // window -> screen coordinates, set by the app delegate
+    var darkRows = false                           // notch rows are drawn on black
+    var swatAt = Date.distantPast
     // kitty moods
     var caughtAt = Date.distantPast, celebrateAt = Date.distantPast, alertAt = Date.distantPast
     var slowSince: Date?
@@ -148,7 +152,8 @@ final class Model: ObservableObject {
         return KittyContext(expanded: expanded, toggledAt: toggledAt, pettedAt: pettedAt, active: isActive,
                             fast: isActive && (status?.speed ?? 0) >= 3 * 1_048_576,
                             worried: isActive && (status?.online == false || now.timeIntervalSince(slowSince ?? now) > 20),
-                            dropTarget: dropTarget, caughtAt: caughtAt, celebrateAt: celebrateAt, alertAt: alertAt)
+                            dropTarget: dropTarget, caughtAt: caughtAt, celebrateAt: celebrateAt, alertAt: alertAt,
+                            swatAt: swatAt)
     }
 
     func announce(_ title: String) {
@@ -227,8 +232,25 @@ final class Model: ObservableObject {
 
     // MARK: row actions
 
-    func retry(_ j: Job) { if send(["retry": j.id]) { caughtAt = Date() } }
-    func remove(_ j: Job) { _ = send(["remove": j.id]); picks[j.id] = nil }
+    func retry(_ j: Job) {
+        guard send(["retry": j.id]) else { return }
+        throwInPit(j, resurrect: true)
+    }
+    func remove(_ j: Job) {
+        _ = send(["remove": j.id]); picks[j.id] = nil
+        throwInPit(j, resurrect: false)
+    }
+
+    /// The row falls into the fiery pit (and, for Retry, rises again).
+    func throwInPit(_ j: Job, resurrect: Bool) {
+        let style = PitStyle.current
+        guard let frame = rowFrames[j.id], let toScreen,
+              let card = pitCard(for: j, title: rowTitle(j), model: self, width: frame.width, dark: darkRows) else { return }
+        let rect = toScreen(frame.insetBy(dx: -14, dy: -14))
+        if Pit.shared.drop(key: j.id, card: card, from: rect, resurrect: resurrect, style: style) && style == .swat {
+            swatAt = Date()
+        }
+    }
     func reveal(_ j: Job) {
         if let p = j.path, FileManager.default.fileExists(atPath: p) {
             NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: p)])
@@ -314,6 +336,7 @@ struct Row: View {
     @ObservedObject var model: Model
     let job: Job
     let title: String
+    var live = false             // on screen (not a measuring/snapshot copy): report where it is
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
             HStack(alignment: .firstTextBaseline) {
@@ -327,6 +350,15 @@ struct Row: View {
             Text(caption).font(.system(size: 10.5).monospacedDigit()).foregroundStyle(Color.soft)
             if job.state == "choosing" { FilePicker(model: model, job: job).padding(.top, 3) }
             else { RowActions(model: model, job: job) }
+        }
+        .background {
+            if live {
+                GeometryReader { g in
+                    Color.clear
+                        .onAppear { model.rowFrames[job.id] = g.frame(in: .global) }
+                        .onChange(of: g.frame(in: .global)) { _, f in model.rowFrames[job.id] = f }
+                }
+            }
         }
     }
 
@@ -406,7 +438,7 @@ struct BarView: View {
                         Text(model.series).font(.system(size: 10.5, weight: .semibold)).foregroundStyle(Color.soft)
                             .textCase(.uppercase).tracking(0.6).padding(.bottom, -5)
                     }
-                    ForEach(model.jobs) { Row(model: model, job: $0, title: model.rowTitle($0)) }
+                    ForEach(model.jobs) { Row(model: model, job: $0, title: model.rowTitle($0), live: measuring == nil && kittyAt == nil) }
                 }
                 .padding(.horizontal, 14)
 
@@ -434,6 +466,7 @@ struct BarView: View {
             Button(model.watchClipboard ? "✓ Offer copied download links" : "Offer copied download links") {
                 model.watchClipboard.toggle()
             }
+            PitMenu()
             if NotchMetrics.find() != nil { Button("Move to notch") { model.switchMode?() } }
             Divider()
             Button("Quit") { NSApp.terminate(nil) }
@@ -544,6 +577,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         host.sizingOptions = []                  // the window never follows SwiftUI's size; we set it
         p.contentView = host
+        model.darkRows = mode == "notch"
+        model.toScreen = { [weak p] r in
+            guard let p else { return r }
+            return CGRect(x: p.frame.minX + r.minX, y: p.frame.maxY - r.maxY, width: r.width, height: r.height)
+        }
         p.orderFrontRegardless()
         panel = p
         bottom = p.frame.minY
@@ -786,9 +824,9 @@ func snapshotNotch(to path: String) {
                 HStack { Text("  Finder   File   Edit   View").font(.system(size: 12, weight: .medium)); Spacer()
                          Text("Sat 24 Oct  09:52  ").font(.system(size: 12, weight: .medium)) }
                     .foregroundStyle(.white).frame(height: m.height)
-                UnevenRoundedRectangle(bottomLeadingRadius: 9, bottomTrailingRadius: 9)    // the physical notch
-                    .fill(.black).frame(width: m.notchWidth, height: m.height)
                 NotchView(model: x, metrics: m, kittyAt: now, measuring: open)
+                UnevenRoundedRectangle(bottomLeadingRadius: 9, bottomTrailingRadius: 9)    // the physical notch: drawn on top,
+                    .fill(Color(white: 0.06)).frame(width: m.notchWidth, height: m.height)  // like the real one hides the screen
             }
             .frame(width: 560, height: open ? 880 : 70)
             .clipped()
@@ -948,6 +986,24 @@ struct PurrloadApp {
     static func main() {
         // Purrload --snapshot out.png : render the expanded bar (light + dark) to an image for checking the design
         useDemoData = CommandLine.arguments.contains("--demo")
+        let args = CommandLine.arguments
+        if let i = args.firstIndex(of: "--pit-storyboard"), i + 1 < args.count {
+            MainActor.assumeIsolated { pitStoryboard(to: args[i + 1]) }
+            return
+        }
+        for (flag, mode) in [("--pit-stress", "stress"), ("--pit-demo", "demo")] {
+            if let i = args.firstIndex(of: flag) {
+                let arg = i + 1 < args.count ? args[i + 1] : (mode == "demo" ? "all" : "/tmp/pit-stress.log")
+                MainActor.assumeIsolated {
+                    let app = NSApplication.shared
+                    let d = PitToolDelegate(mode: mode, arg: arg)
+                    app.delegate = d
+                    app.setActivationPolicy(.accessory)
+                    withExtendedLifetime(d) { app.run() }
+                }
+                return
+            }
+        }
         if CommandLine.arguments.contains("--notify-status") {      // what macOS currently allows Purrload to do
             let done = DispatchSemaphore(value: 0)
             UNUserNotificationCenter.current().getNotificationSettings { s in

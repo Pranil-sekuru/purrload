@@ -22,6 +22,14 @@ Purrload keeps your Safari downloads alive. It stops your Mac from sleeping mid-
 - After downloading, torrents are checked again by content and get the quarantine mark.
 - Finished downloads get **Show in Finder**, failed ones get **Retry**, and both can be cleared with **Remove**.
 
+**The floor is lava**
+- Click **Remove** and the row falls out of the notch into a lava floor that rises across the bottom of the screen, and burns.
+- Click **Retry** and it falls in, burns, then rises back out with a halo and wings while the download starts again.
+- Three styles (right-click → Remove animation): **Classic drop**, **Kitty swat** (the kitty knocks it off the edge, as cats do), and **Phoenix** (it catches fire on the way down). Or turn it off.
+- It's drawn in a click-through overlay that only exists while it plays, and it respects macOS's "Reduce motion" setting.
+
+![The lava floor, frame by frame](docs/images/lava.png)
+
 **A kitty with moods**
 - It hops and sparkles when downloads are fast, and looks worried (with a sweat drop) when they stall or the network drops.
 - It puffs up with a red "!" when the safety check flags a torrent.
@@ -99,7 +107,13 @@ scripts/build.sh --install       # build, copy to ~/Applications, relaunch
 build/Purrload.app/Contents/MacOS/Purrload --demo --snapshot-notch out.png   # render the notch to an image
 build/Purrload.app/Contents/MacOS/Purrload --stress out.log --mode notch     # open/close stress test
 build/Purrload.app/Contents/MacOS/Purrload --selftest out.log                # link detection + inbox checks
+build/Purrload.app/Contents/MacOS/Purrload --pit-demo all                     # watch the lava floor live (~20 s)
+build/Purrload.app/Contents/MacOS/Purrload --pit-stress out.log               # 100 cards: fps, click-through, memory
+build/Purrload.app/Contents/MacOS/Purrload --pit-storyboard out.png           # every style, frame by frame
+scripts/make-icon.sh                                                          # regenerate the app icon
 ```
+
+Animated symbols (sparkles, the kitty's "z"s) are drawn as shapes, not `Text`: drawing text in a Canvas that redraws every frame made memory grow without limit.
 
 The stress test opens and closes the notch or bar 60 times like real clicks, at speeds up to one toggle every 50 ms. It reports:
 - window moves and resizes (should be 0)

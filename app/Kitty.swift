@@ -39,6 +39,7 @@ struct KittyContext {
     var caughtAt = Date.distantPast      // a link was dropped/accepted
     var celebrateAt = Date.distantPast   // everything finished
     var alertAt = Date.distantPast       // a download was flagged
+    var swatAt = Date.distantPast        // knocking a row off the edge (fiery pit, "Kitty swat")
 }
 
 func pose(at now: Date, _ x: KittyContext) -> Pose {
@@ -86,6 +87,11 @@ func pose(at now: Date, _ x: KittyContext) -> Pose {
         p.sleeping = false; p.eyes = .happy; p.earPerk = 3
         p.lift = max(p.lift, 12 * CGFloat(sin(tcatch / 0.9 * .pi)))
     }
+    let tsw = now.timeIntervalSince(x.swatAt)
+    if tsw < 0.6 {                                   // a quick, mischievous swipe
+        p.sleeping = false; p.eyes = .half; p.earPerk = 2
+        p.wave = CGFloat(min(1, tsw * 10, (0.6 - tsw) * 10)); p.waveAngle = CGFloat(sin(tsw * 40)) * 0.8
+    }
     let tc = now.timeIntervalSince(x.celebrateAt)
     if tc < 3 {
         p.confetti = tc / 3; p.sleeping = false; p.eyes = .happy; p.smile = true; p.headDrop = 0
@@ -99,6 +105,35 @@ func pose(at now: Date, _ x: KittyContext) -> Pose {
     if p.eyes == .open && t.truncatingRemainder(dividingBy: 4.3) < 0.14 { p.eyes = .closed }   // blink
     if active && !p.sleeping { p.earPerk += CGFloat(max(0, sin(t * 0.9) - 0.9) * 20) }         // ear twitch
     return p
+}
+
+/// Small symbols for animations, drawn as shapes. Drawing Text in a Canvas that redraws every frame made
+/// memory grow without limit (measured: ~4 MB per resurrection effect), so animated symbols avoid Text.
+enum Glyph { case sparkle, zee, bang }
+
+func drawGlyph(_ c: GraphicsContext, _ glyph: Glyph, size: CGFloat, at p: CGPoint, color: Color, opacity: Double) {
+    var g = c
+    g.opacity = max(0, min(1, opacity))
+    g.translateBy(x: p.x, y: p.y)
+    g.scaleBy(x: size / 16, y: size / 16)         // shapes below are drawn in a 16-point box centred on p
+    switch glyph {
+    case .sparkle:                                 // four-pointed star
+        var s = Path()
+        s.move(to: CGPoint(x: 0, y: -8))
+        s.addQuadCurve(to: CGPoint(x: 8, y: 0), control: CGPoint(x: 1.6, y: -1.6))
+        s.addQuadCurve(to: CGPoint(x: 0, y: 8), control: CGPoint(x: 1.6, y: 1.6))
+        s.addQuadCurve(to: CGPoint(x: -8, y: 0), control: CGPoint(x: -1.6, y: 1.6))
+        s.addQuadCurve(to: CGPoint(x: 0, y: -8), control: CGPoint(x: -1.6, y: -1.6))
+        g.fill(s, with: .color(color))
+    case .zee:
+        var z = Path()
+        z.move(to: CGPoint(x: -4.5, y: -5)); z.addLine(to: CGPoint(x: 4.5, y: -5))
+        z.addLine(to: CGPoint(x: -4.5, y: 5)); z.addLine(to: CGPoint(x: 4.5, y: 5))
+        g.stroke(z, with: .color(color), style: StrokeStyle(lineWidth: 2.6, lineCap: .round, lineJoin: .round))
+    case .bang:
+        g.fill(Path(roundedRect: CGRect(x: -1.9, y: -8, width: 3.8, height: 10.5), cornerRadius: 1.9), with: .color(color))
+        g.fill(Path(ellipseIn: CGRect(x: -2.1, y: 4.3, width: 4.2, height: 4.2)), with: .color(color))
+    }
 }
 
 private let fur = Color(red: 1.0, green: 0.965, blue: 0.925)
@@ -250,17 +285,15 @@ func drawExtras(_ c: GraphicsContext, hx: CGFloat, hy: CGFloat, pose p: Pose, ti
 
     // alert "!"
     if p.alert {
-        let bang = Text("!").font(.system(size: 13, weight: .black, design: .rounded))
-            .foregroundColor(Color(red: 0.94, green: 0.29, blue: 0.36))
-        c.draw(bang, at: CGPoint(x: hx + 14, y: hy - 15))
+        drawGlyph(c, .bang, size: 13, at: CGPoint(x: hx + 14, y: hy - 15), color: Color(red: 0.94, green: 0.29, blue: 0.36), opacity: 1)
     }
 
     // sparkles while downloading fast
     if p.sparkle {
         for (i, (dx, dy)) in [(-16.0, -10.0), (15.0, -14.0), (-12.0, -20.0)].enumerated() {
             let k = (t * 0.9 + Double(i) / 3).truncatingRemainder(dividingBy: 1)
-            let s = Text("✦").font(.system(size: 5 + 4 * sin(k * .pi))).foregroundColor(Color(red: 0.78, green: 0.62, blue: 0.95).opacity(sin(k * .pi)))
-            c.draw(s, at: CGPoint(x: hx + CGFloat(dx), y: hy + CGFloat(dy)))
+            drawGlyph(c, .sparkle, size: 5 + 4 * sin(k * .pi), at: CGPoint(x: hx + CGFloat(dx), y: hy + CGFloat(dy)),
+                      color: Color(red: 0.78, green: 0.62, blue: 0.95), opacity: sin(k * .pi))
         }
     }
 
@@ -283,8 +316,8 @@ func drawExtras(_ c: GraphicsContext, hx: CGFloat, hy: CGFloat, pose p: Pose, ti
     if p.sleeping {
         for i in 0..<3 {
             let k = (t * 0.45 + Double(i) / 3).truncatingRemainder(dividingBy: 1)
-            let txt = Text("z").font(.system(size: 7 + 4 * k, weight: .bold, design: .rounded)).foregroundColor(zColor.opacity(0.75 * (1 - k)))
-            c.draw(txt, at: CGPoint(x: hx + 12 + CGFloat(k) * 10, y: hy - 12 - CGFloat(k) * 20))
+            drawGlyph(c, .zee, size: 7 + 4 * k, at: CGPoint(x: hx + 12 + CGFloat(k) * 10, y: hy - 12 - CGFloat(k) * 20),
+                      color: zColor, opacity: 0.75 * (1 - k))
         }
     }
 }
@@ -315,6 +348,7 @@ struct KittyView: View {
         return !model.expanded && !model.isActive && now.timeIntervalSince(model.toggledAt) > 2.5
             && now.timeIntervalSince(model.pettedAt) > 1.6 && now.timeIntervalSince(model.celebrateAt) > 3.5
             && now.timeIntervalSince(model.alertAt) > 6 && now.timeIntervalSince(model.caughtAt) > 1
+            && now.timeIntervalSince(model.swatAt) > 1
             && !model.dropTarget && model.offer == nil
     }
 
