@@ -8,7 +8,7 @@
   over and resumes it with curl range requests (same byte offset, same URL).
 - Verifies finished files (exact size + Matroska/MP4 header) and notifies.
 """
-import os, re, sys, time, json, plistlib, subprocess, shutil, threading, uuid, tempfile, fcntl, termios, struct
+import os, re, sys, time, json, traceback, plistlib, subprocess, shutil, threading, uuid, tempfile, fcntl, termios, struct
 from collections import deque
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse, parse_qs
@@ -737,37 +737,43 @@ class Engine:
             if j.state not in FINISHED:
                 log(f"{j.name}: picked up again after a restart")
 
+    def tick(self):
+        self.take_inbox()
+        entries = self.read_plist()
+        if entries is not None:
+            self.sync_entries(entries)
+        now = time.time()
+        paused = os.path.exists(PAUSE)
+        if paused != self.paused:
+            self.paused = paused
+            notify("Purrload", "paused" if paused else "resumed")
+        gw = default_gateway()
+        if gw != self.gateway:
+            log(f"network changed: gateway {self.gateway} -> {gw}")
+            self.gateway = gw
+            for j in self.jobs.values():
+                if isinstance(j, DirectJob):
+                    if j.run: j.run.stop()      # its worker restarts it on the new network
+                elif j.state == "takeover":
+                    self.stop_curl(j, "network changed")
+        for j in list(self.jobs.values()):
+            try:
+                self.step_direct(j, now) if isinstance(j, DirectJob) else self.step(j, now)
+            except Exception as e:
+                log(f"{j.name}: error {e!r}")
+        self.keep_awake()
+        self.write_status()
+        self.save_jobs()
+
     def run(self):
         log(f"engine started (pid {os.getpid()}, aria2 {'found' if ARIA2 else 'not found'})")
         os.makedirs(INBOX, exist_ok=True)
         self.restore_jobs()
         while True:
-            self.take_inbox()
-            entries = self.read_plist()
-            if entries is not None:
-                self.sync_entries(entries)
-            now = time.time()
-            paused = os.path.exists(PAUSE)
-            if paused != self.paused:
-                self.paused = paused
-                notify("Purrload", "paused" if paused else "resumed")
-            gw = default_gateway()
-            if gw != self.gateway:
-                log(f"network changed: gateway {self.gateway} -> {gw}")
-                self.gateway = gw
-                for j in self.jobs.values():
-                    if isinstance(j, DirectJob):
-                        if j.run: j.run.stop()      # its worker restarts it on the new network
-                    elif j.state == "takeover":
-                        self.stop_curl(j, "network changed")
-            for j in list(self.jobs.values()):
-                try:
-                    self.step_direct(j, now) if isinstance(j, DirectJob) else self.step(j, now)
-                except Exception as e:
-                    log(f"{j.name}: error {e!r}")
-            self.keep_awake()
-            self.write_status()
-            self.save_jobs()
+            try:
+                self.tick()
+            except Exception:       # one bad tick must not end the engine; keep the traceback
+                log("tick failed, will try again:\n" + traceback.format_exc().rstrip())
             for _ in range(TICK if self.active() else 10):   # check the inbox every second
                 time.sleep(1)
                 if os.listdir(INBOX):

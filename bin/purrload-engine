@@ -3,6 +3,11 @@
 # It reads Safari's download list, so the terminal you start it from needs Full Disk Access.
 ENGINE="${0:A:h}/../engine/purrload-engine.py"
 if pgrep -f "purrload-engine.py" >/dev/null; then echo "Purrload engine is already running."; exit 0; fi
-nohup python3 -I "$ENGINE" >/dev/null 2>&1 &
+# with the launchd agent installed (scripts/install-engine-agent.sh), let it start the engine
+if launchctl kickstart "gui/$(id -u)/io.github.pranil-sekuru.purrload-engine" 2>/dev/null; then
+    echo "Purrload engine started by launchd. Status: purr-progress"; exit 0
+fi
+BASE="${PURRLOAD_HOME:-$HOME/Library/Application Support/Purrload}"; mkdir -p "$BASE"
+nohup python3 -I "$ENGINE" >/dev/null 2>>"$BASE/crash.log" &
 disown
 echo "Purrload engine started. Status: purr-progress"
