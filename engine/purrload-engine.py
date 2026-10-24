@@ -386,7 +386,7 @@ class Engine:
         self.volume_warned = set()
         self.removed = set()                 # rows the user cleared
         self.gateway = default_gateway()
-        self.paused = False
+        self.paused = os.path.exists(PAUSE)  # start in the current state, so a restart doesn't announce "paused" again
 
     def read_plist(self):
         try:
