@@ -41,11 +41,21 @@ def log(msg):
     with open(LOG, "a") as f:
         f.write(line + "\n")
 
-def notify(title, msg):
+EVENTS = deque(maxlen=30)    # notifications for the app to show, published in status.json
+_event_ids = iter(range(1, 1 << 62))
+
+def app_running():
+    return subprocess.run(["pgrep", "-x", "Purrload"], capture_output=True).returncode == 0
+
+def notify(title, msg, path=None):
+    """Show a notification. The Purrload app posts it (with its own name and icon, and a click on a finished
+    download shows it in Finder); if the app isn't running, fall back to AppleScript so nothing is missed."""
     log(f"NOTIFY {title}: {msg}")
-    subprocess.run(["osascript", "-e",
-        f'display notification {json.dumps(msg)} with title {json.dumps(title)} sound name "Glass"'],
-        capture_output=True)
+    EVENTS.append({"id": next(_event_ids), "time": time.time(), "title": title, "body": msg, "path": path})
+    if not app_running():
+        subprocess.run(["osascript", "-e",
+            f'display notification {json.dumps(msg)} with title {json.dumps(title)} sound name "Glass"'],
+            capture_output=True)
 
 def pretty(name):
     """'Show.Name.S01E02.Episode.Title.2160p.WEB-DL...' -> 'Show Name S01E02 Episode Title'"""
@@ -297,7 +307,7 @@ class DirectJob:
         os.rename(self.part, final)
         self.part, self.total, self.state = None, size, "verified"
         self.message, self.path = os.path.basename(final), final
-        notify("Download complete", f"{self.name} ({fmt_bytes(size)})")
+        notify("Download complete", f"{self.name} ({fmt_bytes(size)})", final)
 
     def work_torrent(self):
         if not ARIA2:
@@ -358,11 +368,11 @@ class DirectJob:
         if not self.attempts(make, True, lambda: self.run.proc.returncode == 0):
             return self.fail("torrent download kept failing")
         check = subprocess.run([sys.executable, "-I", INSPECT, "check", os.path.join(self.folder, name)],
-                               capture_output=True, text=True)
+                               capture_output=True, text=True, env={**os.environ, "PURRLOAD_QUIET": "1"})
         if check.returncode == 1:
             return self.fail("the safety check flagged files in it: don't open them", "danger")
         self.state, self.message, self.path = "verified", name, os.path.join(self.folder, name)
-        notify("Download complete", f"{self.name}: checked, nothing suspicious inside")
+        notify("Download complete", f"{self.name}: checked, nothing suspicious inside", self.path)
 
 class Engine:
     def __init__(self):
@@ -460,7 +470,7 @@ class Engine:
             j.state = "corrupt"
             return
         j.state = "verified"
-        notify("Download complete", f"{j.name} verified ({fmt_bytes(size)})")
+        notify("Download complete", f"{j.name} verified ({fmt_bytes(size)})", path)
 
     def step(self, j, now):
         if j.state in ("verified", "corrupt", "expired"):
@@ -569,7 +579,7 @@ class Engine:
         tmp = STATUS_JSON + ".tmp"   # write-then-rename so the bar never reads half a file
         with open(tmp, "w") as f:
             json.dump({"updated": time.time(), "speed": tot_sp, "paused": self.paused,
-                       "online": self.gateway is not None, "jobs": items}, f)
+                       "online": self.gateway is not None, "events": list(EVENTS), "jobs": items}, f)
         os.replace(tmp, STATUS_JSON)
 
     def take_inbox(self):

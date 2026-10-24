@@ -201,9 +201,10 @@ def check(root):
     os.makedirs(f"{BASE}/reports", exist_ok=True)
     with open(f"{BASE}/reports/{os.path.basename(root.rstrip('/'))[:80]}-{datetime.now():%Y%m%d-%H%M%S}.txt", "w") as f:
         f.write(text + "\n")
-    subprocess.run(["osascript", "-e",
-        f'display notification {json.dumps(verdict)} with title "Torrent check" sound name "Glass"'],
-        capture_output=True)
+    if not os.environ.get("PURRLOAD_QUIET"):   # the engine shows its own notification
+        subprocess.run(["osascript", "-e",
+            f'display notification {json.dumps(verdict)} with title "Torrent check" sound name "Glass"'],
+            capture_output=True)
     sys.exit(1 if red else 0)
 
 if __name__ == "__main__":

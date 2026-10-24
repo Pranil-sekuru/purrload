@@ -43,6 +43,7 @@ struct Status: Decodable {
     let speed: Double
     let paused: Bool
     var online: Bool? = nil
+    var events: [EngineEvent]? = nil
     let jobs: [Job]
 }
 
@@ -121,6 +122,7 @@ final class Model: ObservableObject {
             lastStates[j.id] = j.state
         }
         status = s
+        if !useDemoData { Notifier.shared.handle(s.events ?? []) }
         let now = Date()
         let active = activeJobs.count
         if lastActive > 0 && active == 0 && jobs.contains(where: { $0.state == "verified" }) { celebrateAt = now }
@@ -469,6 +471,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     static let openDelay = 0.12, closeDelay = 0.35
 
     func applicationDidFinishLaunching(_ note: Notification) {
+        if !CommandLine.arguments.contains("--stress") { Notifier.shared.start(logTo: model.base) }
         if let i = CommandLine.arguments.firstIndex(of: "--mode"), i + 1 < CommandLine.arguments.count {
             forcedMode = CommandLine.arguments[i + 1]
         }
@@ -836,6 +839,29 @@ func snapshotNotch(to path: String) {
     try? png.write(to: URL(fileURLWithPath: path))
 }
 
+/// Purrload --render-icon out.png : the 1024px app icon (kitty on lilac), turned into AppIcon.icns by scripts/make-icon.sh
+@MainActor
+func renderIcon(to path: String) {
+    let calm = KittyContext(active: true)     // awake, eyes open
+    let icon = ZStack {
+        RoundedRectangle(cornerRadius: 185, style: .continuous)
+            .fill(LinearGradient(colors: [Color(red: 0.80, green: 0.66, blue: 0.95), Color(red: 0.97, green: 0.80, blue: 0.87)],
+                                 startPoint: .top, endPoint: .bottom))
+            .frame(width: 824, height: 824)
+            .shadow(color: .black.opacity(0.25), radius: 18, y: 10)
+        UnevenRoundedRectangle(bottomLeadingRadius: 34, bottomTrailingRadius: 34)                  // a little notch
+            .fill(Color.black.opacity(0.9)).frame(width: 300, height: 56).offset(y: -384)
+        KittyView(model: Model(), frozenAt: Date(timeIntervalSinceReferenceDate: 1.0), mood: calm)
+            .scaleEffect(10).frame(width: 760, height: 720).offset(x: -22, y: -28)
+    }
+    .frame(width: 1024, height: 1024)
+    let r = ImageRenderer(content: icon)
+    r.scale = 1
+    guard let img = r.nsImage, let tiff = img.tiffRepresentation,
+          let png = NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:]) else { return }
+    try? png.write(to: URL(fileURLWithPath: path))
+}
+
 /// Purrload --selftest out.log : logic checks for drop-to-download (link rules, inbox writing).
 @MainActor
 func selftest(to path: String) {
@@ -921,6 +947,10 @@ struct PurrloadApp {
     static func main() {
         // Purrload --snapshot out.png : render the expanded bar (light + dark) to an image for checking the design
         useDemoData = CommandLine.arguments.contains("--demo")
+        if let i = CommandLine.arguments.firstIndex(of: "--render-icon"), i + 1 < CommandLine.arguments.count {
+            MainActor.assumeIsolated { renderIcon(to: CommandLine.arguments[i + 1]) }
+            return
+        }
         if let i = CommandLine.arguments.firstIndex(of: "--selftest"), i + 1 < CommandLine.arguments.count {
             MainActor.assumeIsolated { selftest(to: CommandLine.arguments[i + 1]) }
             return

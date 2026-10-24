@@ -7,7 +7,8 @@ ROOT=${0:A:h:h}
 APP="$ROOT/build/Purrload.app"
 VERSION="0.1.0"
 
-mkdir -p "$APP/Contents/MacOS"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+[[ -f "$ROOT/app/Resources/AppIcon.icns" ]] && cp "$ROOT/app/Resources/AppIcon.icns" "$APP/Contents/Resources/"
 swiftc -O -swift-version 5 -parse-as-library "$ROOT"/app/*.swift -o "$APP/Contents/MacOS/Purrload"
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -17,6 +18,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleDisplayName</key><string>Purrload</string>
   <key>CFBundleIdentifier</key><string>io.github.pranil-sekuru.purrload</string>
   <key>CFBundleExecutable</key><string>Purrload</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>$VERSION</string>
   <key>CFBundleVersion</key><string>$VERSION</string>
