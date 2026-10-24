@@ -20,6 +20,10 @@ struct FilePicker: View {
                 list
             }
 
+            HStack(spacing: 6) {
+                Text("Save to").font(.system(size: 11, weight: .medium)).foregroundStyle(Color.soft)
+                FolderChip(model: model, job: job)
+            }
             HStack(spacing: 14) {
                 Button("Download \(picked.count) · \(gb(model.pickedBytes(job)))") { model.startTorrent(job) }
                     .foregroundStyle(picked.isEmpty ? Color.soft : Color.lilac)

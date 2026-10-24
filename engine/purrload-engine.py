@@ -29,6 +29,7 @@ CURL_HANG_SECS = 60     # curl alive but no bytes this long -> restart it
 PAUSE = f"{BASE}/PAUSE" # touch to pause all curl downloads, delete to resume
 INBOX = f"{BASE}/inbox" # the app drops {"url": ...} files here to start a download
 DOWNLOADS = os.environ.get("PURRLOAD_DOWNLOADS", f"{HOME}/Downloads")
+SETTINGS = f"{BASE}/settings.json"   # written by the app: {"downloadFolder": "/path"}
 INSPECT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "inspect.py")
 ARIA2 = None if os.environ.get("PURRLOAD_NO_ARIA2") else (shutil.which("aria2c") or
         next((p for p in ("/opt/homebrew/bin/aria2c", "/usr/local/bin/aria2c") if os.path.exists(p)), None))
@@ -136,6 +137,27 @@ class Job:
         return (s1 - s0) / (t1 - t0) if t1 > t0 else 0
 
 
+def download_folder():
+    """Where new downloads go: the folder chosen in the app, read fresh for every download."""
+    try:
+        chosen = json.load(open(SETTINGS)).get("downloadFolder")
+    except (OSError, ValueError):
+        chosen = None
+    return os.path.expanduser(chosen) if chosen else DOWNLOADS
+
+def folder_problem(path):
+    """Why we can't save to `path` (in plain words), or None if it's fine. Never silently saves somewhere else."""
+    parts = os.path.abspath(path).split("/")
+    if len(parts) > 2 and parts[1] == "Volumes" and not os.path.ismount(f"/Volumes/{parts[2]}"):
+        return f"\u201c{parts[2]}\u201d isn't connected: plug it in or choose another folder"
+    try:
+        os.makedirs(path, exist_ok=True)
+    except OSError:
+        return f"couldn't create the folder {os.path.basename(path.rstrip('/')) or path}"
+    if not os.access(path, os.W_OK):
+        return f"can't save to {os.path.basename(path.rstrip('/')) or path} (no permission)"
+    return None
+
 def quarantine(path):
     """Mark a file as downloaded so Gatekeeper checks it on first open (curl/aria2 don't do this)."""
     subprocess.run(["xattr", "-w", "com.apple.quarantine", f"0081;{int(time.time()):08x};Purrload;", path],
@@ -223,7 +245,8 @@ class DirectJob:
         self.url = url
         # a magnet, a .torrent file on disk, or a web link to a .torrent file (query strings allowed)
         self.torrent = url.startswith("magnet:") or urlparse(url).path.lower().endswith(".torrent")
-        self.folder = os.path.join(DOWNLOADS, "Torrents") if self.torrent else DOWNLOADS
+        base = download_folder()
+        self.folder = os.path.join(base, "Torrents") if self.torrent else base
         self.name = self.title = "Magnet link" if url.startswith("magnet:") else (
             os.path.basename(urlparse(url).path) or "download")
         self.state = "starting"          # starting -> metadata (magnets) -> choosing (torrents) -> downloading -> verified | corrupt | danger
@@ -263,7 +286,8 @@ class DirectJob:
     # ----- worker thread -----
     def work(self):
         try:
-            os.makedirs(self.folder, exist_ok=True)
+            if not self.torrent and (problem := folder_problem(self.folder)):   # torrents check once a folder is chosen
+                return self.fail(problem)
             self.work_torrent() if self.torrent else self.work_http()
         except Exception as e:
             self.fail(f"error: {e}")
@@ -362,6 +386,8 @@ class DirectJob:
         picked = sorted(i for i in (self.selection or []) if i in allowed)   # never download a blocked file
         if not picked:
             return self.fail("nothing was selected")
+        if problem := folder_problem(self.folder):
+            return self.fail(problem)
         sel = ",".join(map(str, picked))
         self.total = sum(f["size"] for f in self.files if f["index"] in picked)
         self.files = None
@@ -604,6 +630,8 @@ class Engine:
                 j = self.jobs.get(msg["select"])
                 if isinstance(j, DirectJob) and j.state == "choosing":
                     j.selection = [int(i) for i in msg.get("files", [])]
+                    if msg.get("folder"):               # chosen just for this torrent
+                        j.folder = os.path.expanduser(str(msg["folder"]))
                     j.chosen.set()
             elif "retry" in msg:
                 j = self.jobs.get(msg["retry"])

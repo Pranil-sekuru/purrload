@@ -93,6 +93,7 @@ final class Model: ObservableObject {
         set { UserDefaults.standard.set(newValue, forKey: "watchClipboard"); objectWillChange.send() }
     }
     @Published var picks: [String: Set<Int>] = [:]   // torrent file choices, per job
+    @Published var torrentFolders: [String: String] = [:]   // a folder chosen just for one torrent (Folder.swift)
     var rowFrames: [String: CGRect] = [:]          // where each row is in the window (for the fiery pit)
     var toScreen: ((CGRect) -> CGRect)?            // window -> screen coordinates, set by the app delegate
     var darkRows = false                           // notch rows are drawn on black
@@ -225,7 +226,9 @@ final class Model: ObservableObject {
     }
     func startTorrent(_ j: Job) {
         let s = selection(for: j).sorted()
-        guard !s.isEmpty, send(["select": j.id, "files": s]) else { return }
+        var request: [String: Any] = ["select": j.id, "files": s]
+        if let folder = torrentFolders[j.id] { request["folder"] = folder }
+        guard !s.isEmpty, send(request) else { return }
         caughtAt = Date()
         announce("Downloading \(s.count) file\(s.count == 1 ? "" : "s")")
     }
@@ -444,8 +447,8 @@ struct BarView: View {
 
                 HStack(spacing: 16) {
                     Button(model.status?.paused == true ? "Resume" : "Pause") { model.togglePause() }
-                    Button("Open folder") { model.openFolder() }
                     Spacer()
+                    FolderChip(model: model)
                 }
                 .buttonStyle(.plain)
                 .font(.system(size: 11.5, weight: .semibold))
@@ -506,6 +509,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ note: Notification) {
         if !CommandLine.arguments.contains("--stress") { Notifier.shared.start(logTo: model.base) }
+        model.writeSettings()      // the engine reads the download folder from here
         if let i = CommandLine.arguments.firstIndex(of: "--mode"), i + 1 < CommandLine.arguments.count {
             forcedMode = CommandLine.arguments[i + 1]
         }
@@ -987,11 +991,35 @@ func selftest(to path: String) {
         check("Download sends the picked files", msgs.contains { ($0["select"] as? String) == "t1" && ($0["files"] as? [Int]) == [1, 2, 3] })
         check("Retry and Remove send their requests", msgs.contains { $0["retry"] as? String == "w1" } && msgs.contains { $0["remove"] as? String == "w1" })
     }
+    // download folder
+    let savedFolder = UserDefaults.standard.string(forKey: "downloadFolder"), savedRecent = UserDefaults.standard.stringArray(forKey: "recentFolders")
+    m.setFolder("/Volumes/Backup Plus/Movies")
+    let settings = (try? JSONSerialization.jsonObject(with: Data(contentsOf: tmp.appendingPathComponent("settings.json")))) as? [String: String]
+    check("choosing a folder tells the engine", settings?["downloadFolder"] == "/Volumes/Backup Plus/Movies")
+    check("the chosen folder heads the recent list", m.recentFolders.first == "/Volumes/Backup Plus/Movies")
+    for i in 0..<7 { m.downloadFolder = "/tmp/f\(i)" }
+    check("recent folders are capped at 5, newest first", m.recentFolders.count == 5 && m.recentFolders.first == "/tmp/f6")
+    m.downloadFolder = "/tmp/f2"
+    check("picking a recent folder again doesn't duplicate it", m.recentFolders.filter { $0 == "/tmp/f2" }.count == 1)
+    check("folder names read nicely", Folders.name("/Volumes/Backup Plus/Movies") == "Backup Plus › Movies"
+          && Folders.name("/Volumes/Backup Plus") == "Backup Plus")
+    check("an unplugged drive is noticed", Folders.isUnplugged("/Volumes/Definitely Not Plugged In/x") && !Folders.isUnplugged(NSHomeDirectory()))
+    if let tj = st?.jobs.first {
+        check("torrents go to a Torrents folder by default", m.torrentFolder(for: tj) == "/tmp/f2/Torrents")
+        m.torrentFolders[tj.id] = "/tmp/elsewhere"
+        let before2 = Set((try? FileManager.default.contentsOfDirectory(atPath: inbox.path)) ?? [])
+        m.startTorrent(tj)
+        let new = Set((try? FileManager.default.contentsOfDirectory(atPath: inbox.path)) ?? []).subtracting(before2)
+        let req = new.compactMap { try? JSONSerialization.jsonObject(with: Data(contentsOf: inbox.appendingPathComponent($0))) as? [String: Any] }.first
+        check("a folder picked for one torrent is sent with it", req?["folder"] as? String == "/tmp/elsewhere")
+    }
+    if let savedFolder { UserDefaults.standard.set(savedFolder, forKey: "downloadFolder") } else { UserDefaults.standard.removeObject(forKey: "downloadFolder") }
+    if let savedRecent { UserDefaults.standard.set(savedRecent, forKey: "recentFolders") } else { UserDefaults.standard.removeObject(forKey: "recentFolders") }
     m.offer = "magnet:?xt=urn:btih:abc"; m.offerAt = Date()
     check("offer widens the strip", m.wide)
     m.acceptOffer()
     check("accepting the offer queues it and clears it", m.offer == nil &&
-          (((try? FileManager.default.contentsOfDirectory(atPath: inbox.path)) ?? []).count == 5))   // link + select + retry + remove + offer
+          (((try? FileManager.default.contentsOfDirectory(atPath: inbox.path)) ?? []).count == 6))   // link + select + retry + remove + torrent-with-folder + offer
     try? FileManager.default.removeItem(at: tmp)
     lines += ["", "TOTAL \(pass)/\(total)"]
     try? lines.joined(separator: "\n").write(toFile: path, atomically: true, encoding: .utf8)
@@ -1003,6 +1031,17 @@ struct PurrloadApp {
         // Purrload --snapshot out.png : render the expanded bar (light + dark) to an image for checking the design
         useDemoData = CommandLine.arguments.contains("--demo")
         let args = CommandLine.arguments
+        if let i = args.firstIndex(of: "--folder-icon"), i + 1 < args.count {    // the cat-folder, big, for checking
+            MainActor.assumeIsolated {
+                let v = HStack(spacing: 30) { CatFolderIcon(size: 160); CatFolderIcon(size: 17).scaleEffect(4).frame(width: 80, height: 80) }
+                    .padding(30).background(Color.black)
+                let r = ImageRenderer(content: v); r.scale = 2
+                if let t = r.nsImage?.tiffRepresentation, let png = NSBitmapImageRep(data: t)?.representation(using: .png, properties: [:]) {
+                    try? png.write(to: URL(fileURLWithPath: args[i + 1]))
+                }
+            }
+            return
+        }
         if let i = args.firstIndex(of: "--pit-storyboard"), i + 1 < args.count {
             MainActor.assumeIsolated { pitStoryboard(to: args[i + 1]) }
             return

@@ -160,8 +160,8 @@ struct NotchView: View {
             ForEach(model.jobs) { Row(model: model, job: $0, title: model.rowTitle($0), live: measuring == nil && kittyAt == nil) }
             HStack(spacing: 16) {
                 Button(model.status?.paused == true ? "Resume" : "Pause") { model.togglePause() }
-                Button("Open folder") { model.openFolder() }
                 Spacer()
+                FolderChip(model: model)
             }
             .buttonStyle(.plain)
             .font(.system(size: 11.5, weight: .semibold))
