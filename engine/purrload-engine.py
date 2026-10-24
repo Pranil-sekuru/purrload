@@ -41,7 +41,7 @@ TORRENT_HANG_SECS = 600 # torrents go quiet while finding peers; restarting thro
 # discovery, and a write cache (helps a lot on USB / exFAT drives). No extra trackers are added: that would
 # leak private torrents to outside servers.
 TORRENT_SPEED = ["--bt-max-peers=150", "--bt-request-peer-speed-limit=20M", "--bt-enable-lpd=true",
-                 "--enable-peer-exchange=true", "--enable-dht=true", "--disk-cache=64M"]
+                 "--enable-peer-exchange=true", "--enable-dht=true", "--disk-cache=256M"]
 VIDEO_EXTS = (".mkv", ".webm", ".mp4", ".m4v", ".mov")
 
 def log(msg):
@@ -166,6 +166,21 @@ def folder_problem(path):
         return f"can't save to {os.path.basename(path.rstrip('/')) or path} (no permission)"
     return None
 
+def filesystem(path):
+    """The filesystem type of the drive holding `path` (apfs, exfat, msdos, ...), from `mount`."""
+    out = subprocess.run(["/sbin/mount"], capture_output=True, text=True).stdout
+    best, kind = "", ""
+    for line in out.splitlines():
+        m = re.match(r"\S+ on (.+) \(([^,)]+)", line)
+        if m and (path == m.group(1) or path.startswith(m.group(1).rstrip("/") + "/")) and len(m.group(1)) > len(best):
+            best, kind = m.group(1), m.group(2)
+    return kind
+
+def piece_order(folder):
+    """exFAT/FAT drives have no sparse files: writing a torrent piece far into a file makes the drive write zeros
+    over the whole gap first, which stalls the download for minutes. Fetch pieces in order there, so files just grow."""
+    return ["--stream-piece-selector=inorder"] if filesystem(folder) in ("exfat", "msdos", "vfat") else []
+
 def quarantine(path):
     """Mark a file as downloaded so Gatekeeper checks it on first open (curl/aria2 don't do this)."""
     subprocess.run(["xattr", "-w", "com.apple.quarantine", f"0081;{int(time.time()):08x};Purrload;", path],
@@ -206,6 +221,7 @@ class Runner:
     aria2 only prints that readout to a terminal (trimmed to its width), so it gets a 200-column pseudo-terminal."""
     def __init__(self, args, parse):
         self.done = self.total = self.speed = 0
+        self.heard = 0.0                 # when aria2 last printed its progress
         self.parsed = parse
         if not parse:
             self.proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -236,6 +252,7 @@ class Runner:
                     self.total = float(m.group(3)) * UNIT[m.group(4)]
                     d = READOUT_DL.search(text)    # aria2's own speed: the sizes above are rounded to 0.1 GiB
                     self.speed = float(d.group(1)) * UNIT[d.group(2)] if d else 0
+                    self.heard = time.time()
 
     def alive(self):
         return self.proc.poll() is None
@@ -298,7 +315,8 @@ class DirectJob:
 
     def speed(self):
         if self.run and self.run.parsed and self.run.alive():
-            return self.run.speed
+            # aria2 goes quiet when it's stuck (e.g. waiting on a slow drive): don't keep showing its last speed
+            return self.run.speed if time.time() - self.run.heard < 3 else 0
         if len(self.hist) < 2:
             return 0
         (t0, s0), (t1, s1) = self.hist[0], self.hist[-1]
@@ -422,7 +440,7 @@ class DirectJob:
         log(f"{self.name}: torrent, fetching {len(picked)} chosen file(s)")
         make = lambda: [ARIA2, "-d", self.folder, "-T", tor, f"--select-file={sel}", "--bt-remove-unselected-file=true",
                         "-c", "--file-allocation=none", "--seed-time=0", "--max-tries=0", "--retry-wait=5",
-                        "--console-log-level=error", "--summary-interval=0", *TORRENT_SPEED]
+                        "--console-log-level=error", "--summary-interval=0", *TORRENT_SPEED, *piece_order(self.folder)]
         if not self.attempts(make, True, lambda: self.run.proc.returncode == 0):
             return self.fail("torrent download kept failing")
         check = subprocess.run([sys.executable, "-I", INSPECT, "check", os.path.join(self.folder, name)],
