@@ -1,0 +1,106 @@
+# Purrload
+
+**A tiny download manager for macOS with a cat on top.**
+
+Purrload keeps your Safari downloads alive. It stops your Mac from sleeping mid-download, notices stalls and dropped connections, resumes from the exact byte where a download stopped, and checks every file when it finishes. Progress shows in your MacBook's notch, or in a small floating bar, where a kitty naps, yawns and waves while your files come in.
+
+![Purrload in the notch](docs/images/notch.png)
+
+## Features
+
+**Lives in the notch**
+- The notch extends into a slim black strip showing overall progress, with the kitty sitting just right of it.
+- Hover to drop it down into a full list of downloads; move away and it tucks itself back up.
+- When a download finishes and passes its check, the strip briefly widens to say so.
+- No notch, or using an external display? It becomes a floating bar in the corner instead (right-click to switch).
+
+**Keeps downloads alive**
+- Keeps the Mac awake while anything is downloading.
+- Watches each file's real size on disk, so a download that has silently stopped growing gets caught.
+- Picks up a failed or stalled Safari download from the exact byte where it stopped, using HTTP range requests and automatic retries.
+- Restarts stuck connections right away when your network changes (Wi-Fi to hotspot, for example).
+- Warns you when a time-limited download link will expire before the file finishes.
+- Checks every finished file: exact size, plus a valid video header for video files.
+
+**Faster downloads (optional, needs [aria2](https://aria2.github.io/))**
+- `purr` continues Safari's in-progress downloads with up to 16 connections per file.
+
+**Safer torrents (optional, needs aria2)**
+- `purr <magnet link | file.torrent>` lists the files before downloading, and by default fetches only video, audio and subtitles.
+- It checks what each file *actually contains*, so a "video" that is really an app or a script gets flagged.
+- It flags double extensions (`movie.mkv.exe`), hidden right-to-left characters in names, and installers, scripts and archives.
+- Every downloaded file gets macOS's quarantine mark, so Gatekeeper still checks anything you open.
+- These checks help catch disguised files. They don't replace antivirus software.
+
+![Corner bar and kitty poses](docs/images/corner.png)
+
+## Requirements
+
+- macOS 14 or later (notch mode needs a MacBook with a notch)
+- Xcode or the Xcode Command Line Tools (`xcode-select --install`)
+- Python 3 (included with the Command Line Tools)
+- Optional: aria2 (`brew install aria2`) for `purr` and torrents
+
+## Install from source
+
+```sh
+git clone https://github.com/Pranil-sekuru/purrload.git
+cd purrload
+scripts/install.sh
+```
+
+The install script:
+1. Builds `Purrload.app` and copies it to `~/Applications`.
+2. Links the `purr` commands into `~/.local/bin`.
+3. Starts the engine.
+
+**Full Disk Access:** the engine reads Safari's download list, which macOS protects. Give your terminal app Full Disk Access in System Settings → Privacy & Security, then start the engine from that terminal.
+
+## Usage
+
+| Command | What it does |
+|---|---|
+| `purrload-engine` | Start the background engine (it keeps running after the terminal closes) |
+| `purr-progress` | Live view of downloads in the terminal |
+| `purr` | Continue Safari's in-progress downloads with multiple connections |
+| `purr --resume` | Continue an interrupted `purr` run |
+| `purr "magnet:?…"` or `purr file.torrent` | Safe torrent download (`--to DIR`, `--seed`, `--all`, `--trust`) |
+
+- **Pause everything:** right-click the notch or bar, or create a `PAUSE` file in the data folder (handy on metered data).
+- **Pet the kitty:** click it.
+
+## How it works
+
+Purrload has two halves that talk through a single status file:
+
+- **The engine** (`engine/purrload-engine.py`) watches Safari's download list and each file on disk. It keeps the Mac awake, takes over failed or stalled downloads with `curl`, and checks finished files. Every second, it writes the current state to `status.json`.
+- **The app** (`app/`, SwiftUI) reads `status.json` and draws the notch or bar, plus the kitty. The app never downloads anything itself, so quitting it doesn't stop your downloads.
+
+Runtime data lives in `~/Library/Application Support/Purrload` (set `PURRLOAD_HOME` to change it). Nothing is ever sent anywhere: Purrload has no telemetry, no analytics and no network access of its own apart from the downloads you start. Download links can contain access tokens, so they are never written to logs.
+
+## Development
+
+```sh
+scripts/build.sh                 # build ./build/Purrload.app
+scripts/build.sh --install       # build, copy to ~/Applications, relaunch
+build/Purrload.app/Contents/MacOS/Purrload --demo --snapshot-notch out.png   # render the notch to an image
+build/Purrload.app/Contents/MacOS/Purrload --stress out.log --mode notch     # open/close stress test
+```
+
+The stress test opens and closes the notch or bar 60 times like real clicks, at speeds up to one toggle every 50 ms. It reports:
+- window moves and resizes (should be 0)
+- the kitty's frame rate
+- whether clicks land in the right places (the menu bar beside the notch must stay clickable)
+- whether hover-to-open behaves correctly
+
+## Roadmap
+
+- Safari extension: "Download with Purrload" in the right-click menu (needs Xcode)
+- Handle `magnet:` links and `.torrent` files directly from the app
+- Swift download engine built on aria2's remote-control (JSON-RPC) interface, replacing the Python engine
+- Settings window: download folder, connections, speed limit, auto-pause on mobile hotspot data
+- Signed and notarized releases, Homebrew cask, automatic updates
+
+## License
+
+MIT. See [LICENSE](LICENSE). aria2 is a separate GPL program that Purrload calls if it's installed; it isn't bundled.

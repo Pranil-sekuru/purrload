@@ -1,0 +1,18 @@
+# build output
+build/
+*.app
+__pycache__/
+*.pyc
+.DS_Store
+
+# runtime data: never commit (contains file names and signed download URLs)
+status.json
+status.txt
+*.log
+*.err
+reports/
+purr/
+.boost/
+PAUSE
+*.part
+*.aria2

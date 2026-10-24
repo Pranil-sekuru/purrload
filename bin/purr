@@ -1,0 +1,76 @@
+#!/bin/zsh
+# Hand Safari's in-progress downloads to aria2 with multiple connections per file.
+# Usage: purr [--dry-run | --resume] [connections per file, default 8]
+#        purr [torrent options] <magnet link | file.torrent>   (see purr-torrent)
+set -euo pipefail
+
+HERE=${0:A:h}
+STATE="${PURRLOAD_HOME:-$HOME/Library/Application Support/Purrload}/purr"   # private: holds signed URLs, removed when done
+DRY=0; RESUME=0
+[[ "${1:-}" == "--dry-run" ]] && { DRY=1; shift; }
+[[ "${1:-}" == "--resume" ]] && { RESUME=1; shift; }
+CONN="${1:-8}"
+
+# Torrents go to the safe torrent downloader
+for arg in "$@"; do [[ "$arg" == magnet:* || "$arg" == *.torrent ]] && exec "$HERE/purr-torrent" "$@"; done
+
+if ! command -v aria2c >/dev/null; then
+  (( DRY )) && echo "(aria2 not installed; a real run installs it with brew)" || { echo "Installing aria2..."; brew install aria2; }
+fi
+
+if (( RESUME )); then
+  [[ -f "$STATE/jobs.tsv" ]] || { echo "Nothing to resume."; exit 0; }
+  JOBS=$(<"$STATE/jobs.tsv")
+else
+# One line per unfinished download: partial<TAB>total<TAB>url
+JOBS=$(python3 -I - <<'EOF'
+import plistlib, os
+h = plistlib.load(open(os.path.expanduser("~/Library/Safari/Downloads.plist"), "rb"))["DownloadHistory"]
+for e in h:
+    p = e.get("DownloadEntryPath", "")
+    if ".download/" in p and "DownloadEntryDateFinishedKey" not in e and os.path.exists(p):
+        print(f'{p}\t{e.get("DownloadEntryProgressTotalToLoad", 0)}\t{e["DownloadEntryURL"]}')
+EOF
+)
+[[ -z "$JOBS" ]] && { echo "No unfinished Safari downloads found."; exit 0; }
+[[ -f "$STATE/jobs.tsv" ]] && { echo "A takeover is already in progress: run purr --resume"; exit 1; }
+
+echo "Found:"
+while IFS=$'\t' read -r p total url; do
+  printf "  %-60.60s %6.1f%%\n" "$(basename "$p")" $(( 100.0 * $(stat -f %z "$p") / total ))
+done <<< "$JOBS"
+(( DRY )) && { echo "(dry run: nothing changed)"; exit 0; }
+
+echo "\nPause ALL of these in Safari (Downloads list → pause button), then press Enter."
+read -r
+echo "Checking Safari has stopped writing..."
+sizes() { while IFS=$'\t' read -r p _ _; do stat -f %z "$p"; done <<< "$JOBS"; }
+a=$(sizes); sleep 5; b=$(sizes)
+[[ "$a" != "$b" ]] && { echo "Files are still growing. Pause them in Safari and run purr again."; exit 1; }
+
+mkdir -p "$STATE"; chmod 700 "$STATE"
+LIST="$STATE/aria2.txt"; : > "$LIST"; chmod 600 "$LIST"
+print -r -- "$JOBS" > "$STATE/jobs.tsv"; chmod 600 "$STATE/jobs.tsv"
+while IFS=$'\t' read -r p total url; do
+  final="$(dirname "$(dirname "$p")")/$(basename "$p")"
+  mv "$p" "$final.part"        # out of Safari's bundle so Safari can't overwrite it
+  printf '%s\n  dir=%s\n  out=%s\n' "$url" "$(dirname "$final")" "$(basename "$final").part" >> "$LIST"
+done <<< "$JOBS"
+fi
+LIST="$STATE/aria2.txt"
+
+echo "Downloading with $CONN connections per file. Ctrl-C is safe: continue later with  purr --resume"
+aria2c -i "$LIST" -c -j 10 -x "$CONN" -s "$CONN" -k 1M \
+  --file-allocation=none --auto-file-renaming=false --allow-overwrite=false \
+  --retry-wait=5 --max-tries=0 --console-log-level=warn --summary-interval=0 || true
+
+while IFS=$'\t' read -r p total url; do
+  final="$(dirname "$(dirname "$p")")/$(basename "$p")"
+  if [[ -f "$final.part" && ! -f "$final.part.aria2" && $(stat -f %z "$final.part") == "$total" ]]; then
+    mv "$final.part" "$final" && rm -rf "$(dirname "$p")"
+    echo "done: $(basename "$final")"
+  else
+    echo "not finished: $(basename "$final")"; left=1
+  fi
+done <<< "$JOBS"
+if [[ -n "${left:-}" ]]; then echo "Continue with:  purr --resume"; else rm -rf "$STATE"; fi

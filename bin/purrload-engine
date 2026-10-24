@@ -1,0 +1,8 @@
+#!/bin/zsh
+# Start the Purrload engine in the background (it keeps running after the terminal closes).
+# It reads Safari's download list, so the terminal you start it from needs Full Disk Access.
+ENGINE="${0:A:h}/../engine/purrload-engine.py"
+if pgrep -f "purrload-engine.py" >/dev/null; then echo "Purrload engine is already running."; exit 0; fi
+nohup python3 -I "$ENGINE" >/dev/null 2>&1 &
+disown
+echo "Purrload engine started. Status: purr-progress"

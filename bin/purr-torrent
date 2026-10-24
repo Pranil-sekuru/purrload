@@ -1,0 +1,44 @@
+#!/bin/zsh
+# Download a torrent with aria2: fetch only media/subtitles, then inspect and quarantine.
+# Usage: purr [--to DIR] [--seed] [--all | --trust] <magnet link | file.torrent>
+# Re-running the same command resumes an interrupted download.
+set -euo pipefail
+
+ENGINE="${0:A:h}/../engine"
+DEST="$HOME/Downloads/Torrents"; SEED=0; ALL=0; SRC=""
+while (( $# )); do
+  case "$1" in
+    --to)   DEST="$2"; shift 2 ;;
+    --seed) SEED=1; shift ;;
+    --all)  ALL=1; shift ;;       # also fetch non-media files (dangerous ones are still skipped)
+    --trust) ALL=2; shift ;;      # fetch everything, e.g. a Linux ISO from its official site
+    *)      SRC="$1"; shift ;;
+  esac
+done
+[[ -z "$SRC" ]] && { echo "usage: purr [--to DIR] [--seed] [--all] <magnet|file.torrent>"; exit 1; }
+command -v aria2c >/dev/null || { echo "Installing aria2..."; brew install aria2; }
+
+WORK=$(mktemp -d); trap 'rm -rf "$WORK"' EXIT
+if [[ "$SRC" == magnet:* ]]; then
+  echo "Fetching the torrent's file list from peers (up to 2 min)..."
+  aria2c -d "$WORK" --bt-metadata-only=true --bt-save-metadata=true --bt-stop-timeout=120 \
+    --console-log-level=error --summary-interval=0 "$SRC" >/dev/null 2>&1 || true
+  TOR=$(ls "$WORK"/*.torrent 2>/dev/null | head -1 || true)
+  [[ -z "$TOR" ]] && { echo "Couldn't get the file list: no peers answered."; exit 1; }
+else
+  TOR="$SRC"
+fi
+
+PLAN=$(python3 -I "$ENGINE/inspect.py" plan "$TOR" "$ALL") || exit 1
+NAME=${PLAN%%$'\n'*}; SEL=${PLAN#*$'\n'}
+read -r "?Download the files marked 'get' to $DEST? [y/N] " ok
+[[ "$ok" == [yY]* ]] || exit 0
+
+mkdir -p "$DEST"
+SEEDOPT=(--seed-time=0); (( SEED )) && SEEDOPT=(--seed-ratio=1.0)
+aria2c -d "$DEST" -T "$TOR" --select-file="$SEL" --bt-remove-unselected-file=true -c \
+  --file-allocation=none --max-tries=0 --retry-wait=5 --console-log-level=warn \
+  --summary-interval=0 "${SEEDOPT[@]}" || { echo "Interrupted. Run the same command again to resume."; exit 1; }
+
+echo "\nChecking what arrived..."
+python3 -I "$ENGINE/inspect.py" check "$DEST/$NAME"

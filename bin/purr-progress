@@ -1,0 +1,9 @@
+#!/bin/zsh
+# Live terminal view of the Purrload engine. Ctrl-C to exit.
+S="${PURRLOAD_HOME:-$HOME/Library/Application Support/Purrload}"
+while true; do
+  clear; cat "$S/status.txt" 2>/dev/null || echo "Engine isn't running (start it with: purrload-engine)"
+  echo; echo "recent events:"; tail -5 "$S/engine.log" 2>/dev/null | cut -c12-150
+  [[ -f "$S/PAUSE" ]] && echo "\n[PAUSED: rm \"$S/PAUSE\" to resume]"
+  sleep 3
+done
