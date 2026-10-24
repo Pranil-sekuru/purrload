@@ -3,6 +3,7 @@
 import SwiftUI
 import AppKit
 import Combine
+import UserNotifications
 
 // MARK: - Data from the engine
 
@@ -947,6 +948,16 @@ struct PurrloadApp {
     static func main() {
         // Purrload --snapshot out.png : render the expanded bar (light + dark) to an image for checking the design
         useDemoData = CommandLine.arguments.contains("--demo")
+        if CommandLine.arguments.contains("--notify-status") {      // what macOS currently allows Purrload to do
+            let done = DispatchSemaphore(value: 0)
+            UNUserNotificationCenter.current().getNotificationSettings { s in
+                let names = [0: "not decided", 1: "denied", 2: "allowed", 3: "provisional", 4: "ephemeral"]
+                print("authorization: \(names[s.authorizationStatus.rawValue] ?? "?")  alerts: \(s.alertSetting.rawValue == 2 ? "on" : "off")  style: \(s.alertStyle.rawValue)")
+                done.signal()
+            }
+            while done.wait(timeout: .now() + 0.05) == .timedOut { RunLoop.current.run(until: Date().addingTimeInterval(0.05)) }
+            return
+        }
         if let i = CommandLine.arguments.firstIndex(of: "--render-icon"), i + 1 < CommandLine.arguments.count {
             MainActor.assumeIsolated { renderIcon(to: CommandLine.arguments[i + 1]) }
             return

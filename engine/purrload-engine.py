@@ -44,15 +44,20 @@ def log(msg):
 EVENTS = deque(maxlen=30)    # notifications for the app to show, published in status.json
 _event_ids = iter(range(1, 1 << 62))
 
-def app_running():
-    return subprocess.run(["pgrep", "-x", "Purrload"], capture_output=True).returncode == 0
+def app_can_notify():
+    """True if the Purrload app is running and macOS lets it show notifications (it writes that answer for us)."""
+    try:
+        allowed = open(f"{BASE}/notifications").read().strip() == "allowed"
+    except OSError:
+        allowed = False
+    return allowed and subprocess.run(["pgrep", "-x", "Purrload"], capture_output=True).returncode == 0
 
 def notify(title, msg, path=None):
     """Show a notification. The Purrload app posts it (with its own name and icon, and a click on a finished
-    download shows it in Finder); if the app isn't running, fall back to AppleScript so nothing is missed."""
+    download shows it in Finder); if the app isn't running or isn't allowed to notify, fall back to AppleScript."""
     log(f"NOTIFY {title}: {msg}")
     EVENTS.append({"id": next(_event_ids), "time": time.time(), "title": title, "body": msg, "path": path})
-    if not app_running():
+    if not app_can_notify():
         subprocess.run(["osascript", "-e",
             f'display notification {json.dumps(msg)} with title {json.dumps(title)} sound name "Glass"'],
             capture_output=True)

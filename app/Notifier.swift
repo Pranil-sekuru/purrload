@@ -15,15 +15,31 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
     static let shared = Notifier()
     private var lastSeen: Int?          // nil until the first status read: events from before launch aren't replayed
 
+    private var base: URL?
+
     func start(logTo base: URL) {
+        self.base = base
         let center = UNUserNotificationCenter.current()
         center.delegate = self
+        Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { _ in   // the user can change it in System Settings
+            Task { @MainActor in Notifier.shared.publishPermission() }
+        }
         center.requestAuthorization(options: [.alert, .sound]) { granted, error in
             // Recorded so "why don't I get notifications?" has an answer (see app.log in the data folder).
             let line = "\(Date()) notifications \(granted ? "allowed" : "not allowed")\(error.map { ": \($0.localizedDescription)" } ?? "")\n"
             let log = base.appendingPathComponent("app.log")
             if let h = try? FileHandle(forWritingTo: log) { h.seekToEndOfFile(); h.write(Data(line.utf8)); try? h.close() }
             else { try? line.write(to: log, atomically: true, encoding: .utf8) }
+            Task { @MainActor in Notifier.shared.publishPermission() }
+        }
+    }
+
+    /// Tell the engine whether Purrload may show notifications: if not, the engine falls back to AppleScript.
+    func publishPermission() {
+        guard let base else { return }
+        UNUserNotificationCenter.current().getNotificationSettings { s in
+            let ok = s.authorizationStatus == .authorized && s.alertSetting == .enabled
+            try? (ok ? "allowed" : "not allowed").write(to: base.appendingPathComponent("notifications"), atomically: true, encoding: .utf8)
         }
     }
 
