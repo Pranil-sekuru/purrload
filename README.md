@@ -78,17 +78,39 @@ scripts/install.sh
 ```
 
 The install script:
-1. Builds `Purrload.app` and copies it to `~/Applications`.
+1. Builds `Purrload.app`, copies it to `~/Applications` and opens it.
 2. Links the `purr` commands into `~/.local/bin`.
-3. Starts the engine.
 
-**Full Disk Access:** the engine reads Safari's download list, which macOS protects. Give your terminal app Full Disk Access in System Settings → Privacy & Security, then start the engine from that terminal.
+The app starts the engine itself. On first launch it asks whether to keep downloading after you quit it (see below).
+
+## What Purrload does on your Mac
+
+Everything here is optional unless it says otherwise, and **right-click → Background engine → Uninstall Purrload…** undoes all of it. Files you downloaded are never touched by uninstalling.
+
+**Always**
+- Keeps its data in `~/Library/Application Support/Purrload`: the download list (`jobs.json`, readable only by you, because download links can contain access tokens), status, logs, settings, and copies of `.torrent` files you open. Its preferences are under `io.github.pranil-sekuru.purrload`.
+- Keeps the Mac awake (`caffeinate`) while something is downloading, and lets it sleep again when nothing is, including when the only downloads left are paused.
+- Marks downloaded files with macOS's quarantine flag, so Gatekeeper checks anything you open, as it does for Safari downloads.
+- Becomes the app that opens `magnet:` links and `.torrent` files, unless another app already is (right-click → **Open magnet links and .torrent files** to change it).
+
+**Only if you say yes**
+- **Keep downloading after Purrload quits** (asked on first launch): adds a background agent, `~/Library/LaunchAgents/io.github.pranil-sekuru.purrload-engine.plist`, that runs `Purrload --engine` at login and restarts it if it stops. Without it, downloads run only while Purrload is open.
+- **Open Purrload at login**: a normal login item, listed in System Settings → General → Login Items.
+- **Notifications**: posted when a download finishes or needs you.
+- **Full Disk Access**: needed only to rescue Safari downloads, because Safari's download list is protected. Purrload asks once. Grant it to Purrload in System Settings → Privacy & Security → Full Disk Access; everything else works without it.
+
+**What it reads**
+- Safari's download list (with Full Disk Access) and the files being downloaded.
+- The clipboard, only to spot copied download links. This stays on your Mac; right-click → **Offer copied download links** turns it off.
+
+**Network**
+- Only the downloads you start, plus the BitTorrent network (peers, DHT, peer exchange) for torrents. No telemetry, no analytics, no update checks, and no extra trackers added to your torrents.
 
 ## Usage
 
 | Command | What it does |
 |---|---|
-| `purrload-engine` | Start the background engine (it keeps running after the terminal closes) |
+| `purrload-engine` | Start the engine from a terminal (only if you don't use the app's background engine) |
 | `purr-progress` | Live view of downloads in the terminal |
 | `purr` | Continue Safari's in-progress downloads with multiple connections |
 | `purr --resume` | Continue an interrupted `purr` run |
