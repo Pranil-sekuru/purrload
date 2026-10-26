@@ -531,14 +531,26 @@ class Engine:
         self.removed = set()
         self.gateway = default_gateway()
         self.paused = os.path.exists(PAUSE)  # start in the current state, so a restart doesn't announce "paused" again
+        self.safari = "ok"                   # "blocked": no Full Disk Access, so Safari downloads aren't watched
 
     def read_plist(self):
         try:
             with open(PLIST, "rb") as f:
-                return plistlib.load(f).get("DownloadHistory", [])
+                entries = plistlib.load(f).get("DownloadHistory", [])
+        except PermissionError:
+            if self.safari != "blocked":
+                log("can't read Safari's download list: Purrload needs Full Disk Access to watch Safari downloads")
+            self.safari = "blocked"
+            return None
+        except FileNotFoundError:
+            return None         # Safari hasn't downloaded anything yet
         except Exception as e:  # Safari may be mid-write
             log(f"plist read failed ({e}); retrying next tick")
             return None
+        if self.safari == "blocked":
+            log("can read Safari's download list again")
+        self.safari = "ok"
+        return entries
 
     def sync_entries(self, entries):
         for e in entries:
@@ -731,7 +743,8 @@ class Engine:
         tmp = STATUS_JSON + ".tmp"   # write-then-rename so the bar never reads half a file
         with open(tmp, "w") as f:
             json.dump({"updated": time.time(), "speed": tot_sp, "paused": self.paused,
-                       "online": self.gateway is not None, "events": list(EVENTS), "jobs": items}, f)
+                       "online": self.gateway is not None, "events": list(EVENTS), "safari": self.safari,
+                       "jobs": items}, f)
         os.replace(tmp, STATUS_JSON)
 
     def take_inbox(self):

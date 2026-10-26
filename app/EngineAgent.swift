@@ -1,5 +1,7 @@
 // The engine runs either under launchd (opt-in: starts at login, restarted if it stops) or as the app's child
 // while the app is open. Always from inside the signed app, and only if the app's signature is intact.
+// Under launchd it is started through `Purrload --engine`, so macOS asks about Purrload's permissions (Full Disk
+// Access for Safari's download list), not python3's.
 import SwiftUI
 import AppKit
 import ServiceManagement
@@ -22,11 +24,12 @@ enum EngineAgent {
     static var isInstalled: Bool { FileManager.default.fileExists(atPath: plistURL.path) }
     static var opensAtLogin: Bool { SMAppService.mainApp.status == .enabled }
 
-    /// Older versions ran a copy in Application Support.
-    static var installedEnginePath: String? {
+    /// What the agent should run. Older versions ran python3 on a copy in Application Support, then on the bundled engine.
+    static var program: [String] { [Bundle.main.executablePath ?? "", "--engine"] }
+    static var installedProgram: [String]? {
         guard let d = try? Data(contentsOf: plistURL),
               let p = try? PropertyListSerialization.propertyList(from: d, format: nil) as? [String: Any] else { return nil }
-        return (p["ProgramArguments"] as? [String])?.last
+        return p["ProgramArguments"] as? [String]
     }
 
     /// False if any file in the app (the engine included) changed after it was signed.
@@ -49,7 +52,7 @@ enum EngineAgent {
         if ProcessInfo.processInfo.environment["PURRLOAD_HOME"] != nil { env["PURRLOAD_HOME"] = base.path }
         let plist: [String: Any] = [
             "Label": label,
-            "ProgramArguments": [python, "-I", engine.path],
+            "ProgramArguments": program,
             "EnvironmentVariables": env,
             "RunAtLoad": true,
             "KeepAlive": true,
@@ -108,15 +111,36 @@ enum EngineAgent {
 
     nonisolated(unsafe) static var child: Process?
 
-    static func startWithApp(base: URL) {
-        guard !isInstalled, child?.isRunning != true, let engine = try? engine() else { return }
+    static func engineProcess(_ engine: URL, base: URL?) -> Process {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: python)
         p.arguments = ["-I", engine.path]
         var env = ProcessInfo.processInfo.environment
         env["PATH"] = path                // opened from Finder the app has no Homebrew on its PATH, so no aria2
-        env["PURRLOAD_HOME"] = base.path
+        if let base { env["PURRLOAD_HOME"] = base.path }
         p.environment = env
+        return p
+    }
+
+    /// `Purrload --engine`, what the launchd agent runs: the engine as our child, stopped when launchd stops us.
+    static func runHeadless() -> Int32 {
+        guard let engine = try? engine() else {
+            FileHandle.standardError.write(Data("Purrload: the engine won't run (missing, or the app was changed)\n".utf8))
+            return 1
+        }
+        let p = engineProcess(engine, base: nil)
+        signal(SIGTERM, SIG_IGN)
+        let term = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .global())
+        term.setEventHandler { p.terminate() }        // the engine saves its downloads and stops aria2
+        term.resume()
+        do { try p.run() } catch { return 1 }
+        p.waitUntilExit()
+        return p.terminationStatus
+    }
+
+    static func startWithApp(base: URL) {
+        guard !isInstalled, child?.isRunning != true, let engine = try? engine() else { return }
+        let p = engineProcess(engine, base: base)
         p.standardOutput = FileHandle.nullDevice
         let log = base.appendingPathComponent("crash.log")
         if !FileManager.default.fileExists(atPath: log.path) { FileManager.default.createFile(atPath: log.path, contents: nil) }
@@ -151,7 +175,7 @@ enum EngineAgent {
             return
         }
         if !isInstalled { return startWithApp(base: model.base) }
-        if let e = bundledEngine?.path, installedEnginePath != e, model.activeJobs.isEmpty {
+        if bundledEngine != nil, installedProgram != program, model.activeJobs.isEmpty {
             working = true
             let base = model.base
             Task.detached { try? install(base: base); working = false }
@@ -251,6 +275,31 @@ enum EngineAgentPrompt {
     }
 }
 
+/// Watching Safari's downloads needs Full Disk Access (Safari's download list is protected). Only the user can grant it.
+@MainActor
+enum SafariAccess {
+    static func askOnce() {
+        guard UserDefaults.standard.object(forKey: "safariAccessAsked") == nil else { return }
+        UserDefaults.standard.set(true, forKey: "safariAccessAsked")
+        DispatchQueue.main.async { MainActor.assumeIsolated { ask() } }      // not from inside a status update
+    }
+
+    static func ask() {
+        let a = NSAlert()
+        a.messageText = "Let Purrload rescue Safari downloads?"
+        a.informativeText = "Purrload can pick up a Safari download that stalls or fails, from the byte where it stopped. "
+            + "To see them it has to read Safari's download list, which macOS only allows with Full Disk Access.\n\n"
+            + "Open Settings, then turn on Purrload under Full Disk Access (or click + and choose Purrload). "
+            + "Everything else works without it."
+        a.addButton(withTitle: "Open Settings")
+        a.addButton(withTitle: "Not now")
+        NSApp.activate(ignoringOtherApps: true)
+        guard a.runModal() == .alertFirstButtonReturn else { return }
+        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")!)
+        NSWorkspace.shared.activateFileViewerSelecting([Bundle.main.bundleURL])   // to drag it in
+    }
+}
+
 struct EngineMenu: View {
     @ObservedObject var model: Model
     var body: some View {
@@ -261,6 +310,7 @@ struct EngineMenu: View {
             }
             let login = EngineAgent.opensAtLogin
             Button((login ? "✓ " : "") + "Open Purrload at login") { EngineAgentPrompt.setOpensAtLogin(!login, model: model) }
+            if model.status?.safari == "blocked" { Button("Rescue Safari downloads…") { SafariAccess.ask() } }
             Divider()
             Button("Uninstall Purrload…") { EngineAgentPrompt.confirmUninstall(model: model) }
         }

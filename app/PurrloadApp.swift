@@ -50,6 +50,7 @@ struct Status: Decodable {
     let paused: Bool
     var online: Bool? = nil
     var events: [EngineEvent]? = nil
+    var safari: String? = nil           // "blocked": the engine can't read Safari's download list
     let jobs: [Job]
 }
 
@@ -137,6 +138,7 @@ final class Model: ObservableObject {
         }
         status = s
         if !useDemoData { Notifier.shared.handle(s.events ?? []) }
+        if s.safari == "blocked" && !useDemoData { SafariAccess.askOnce() }
         let now = Date()
         let active = activeJobs.count
         if lastActive > 0 && active == 0 && jobs.contains(where: { $0.state == "verified" }) && !jobs.contains(where: { $0.held == true }) {
@@ -989,7 +991,7 @@ func selftest(to path: String) {
     if let engine, let d = try? EngineAgent.plistData(base: tmp, engine: engine),
        let p = try? PropertyListSerialization.propertyList(from: d, format: nil) as? [String: Any] {
         check("engine agent starts at login and restarts the engine", p["RunAtLoad"] as? Bool == true && p["KeepAlive"] as? Bool == true)
-        check("engine agent runs the engine inside the app", (p["ProgramArguments"] as? [String])?.last == engine.path)
+        check("engine agent runs the app's headless engine mode", (p["ProgramArguments"] as? [String]) == [Bundle.main.executablePath!, "--engine"])
         check("engine agent can find Homebrew's aria2", ((p["EnvironmentVariables"] as? [String: String])?["PATH"] ?? "").contains("/opt/homebrew/bin"))
         check("engine agent keeps crashes in crash.log", (p["StandardErrorPath"] as? String)?.hasSuffix("/crash.log") == true)
     } else { check("engine agent plist builds", false) }
@@ -1115,6 +1117,7 @@ struct PurrloadApp {
         // Purrload --snapshot out.png : render the expanded bar (light + dark) to an image for checking the design
         useDemoData = CommandLine.arguments.contains("--demo")
         let args = CommandLine.arguments
+        if args.count == 2 && args[1] == "--engine" { exit(EngineAgent.runHeadless()) }
         if let i = args.firstIndex(of: "--folder-icon"), i + 1 < args.count {
             MainActor.assumeIsolated {
                 let v = HStack(spacing: 30) { CatFolderIcon(size: 160); CatFolderIcon(size: 17).scaleEffect(4).frame(width: 80, height: 80) }
