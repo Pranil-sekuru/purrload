@@ -59,10 +59,28 @@ extension Model {
     }
 
     func enqueue(_ link: String) {
-        guard send(["url": link]) else { return }
+        guard send(["url": keepTorrent(link)]) else { return }
         caughtAt = Date()
         let name = Links.displayName(link)
         announce(guardRunning ? "Added \(name.prefix(22))" : "Queued, engine is off")
+    }
+
+    /// A .torrent file gets copied into Purrload's folder: people delete the one in Downloads,
+    /// and the engine reads it again after a restart.
+    func keepTorrent(_ link: String) -> String {
+        guard link.hasPrefix("/") else { return link }
+        let dir = base.appendingPathComponent("torrents")
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let copy = dir.appendingPathComponent("\(UUID().uuidString.prefix(8))-\(URL(fileURLWithPath: link).lastPathComponent)")
+        return (try? FileManager.default.copyItem(at: URL(fileURLWithPath: link), to: copy)) != nil ? copy.path : link
+    }
+
+    /// Magnet links and .torrent files opened from Safari or Finder.
+    func open(_ urls: [URL]) {
+        for u in urls {
+            let link = u.isFileURL ? u.path : u.absoluteString
+            if let l = Links.accept(link) { enqueue(l) } else { announce("Can't open \(u.lastPathComponent.prefix(20))") }
+        }
     }
 
     func acceptOffer() {
@@ -80,6 +98,32 @@ extension Model {
         guard watchClipboard, let s = pb.string(forType: .string), let link = Links.find(in: s), link != offer else { return }
         offerAt = Date()
         withAnimation(.spring(response: 0.38, dampingFraction: 0.82)) { offer = link }
+    }
+}
+
+/// Whether clicking a magnet link or opening a .torrent file goes to Purrload.
+enum TorrentHandler {
+    static let torrentType = UTType(importedAs: "org.bittorrent.torrent")
+    static var isDefault: Bool {
+        let me = Bundle.main.bundleURL.standardizedFileURL
+        return NSWorkspace.shared.urlForApplication(toOpen: URL(string: "magnet:?xt=")!)?.standardizedFileURL == me
+            && NSWorkspace.shared.urlForApplication(toOpen: torrentType)?.standardizedFileURL == me
+    }
+    static func makeDefault(model: Model) {
+        let me = Bundle.main.bundleURL
+        NSWorkspace.shared.setDefaultApplication(at: me, toOpenURLsWithScheme: "magnet") { err in
+            NSWorkspace.shared.setDefaultApplication(at: me, toOpen: torrentType) { err2 in
+                Task { @MainActor in model.announce((err ?? err2) == nil ? "Torrents open in Purrload" : "macOS said no") }
+            }
+        }
+    }
+}
+
+struct TorrentHandlerMenu: View {
+    @ObservedObject var model: Model
+    var body: some View {
+        if TorrentHandler.isDefault { Button("✓ Opens magnet links and .torrent files") {}.disabled(true) }
+        else { Button("Open magnet links and .torrent files") { TorrentHandler.makeDefault(model: model) } }
     }
 }
 

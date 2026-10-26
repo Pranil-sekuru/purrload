@@ -330,8 +330,9 @@ struct KittyView: View {
         Group {
             if let at = frozenAt { canvas(at) }
             else {
-                // Full display rate while moving; a slow tick while napping (body re-evaluates each status update)
-                TimelineView(.animation(minimumInterval: napping ? 1 / 12 : nil)) { ctx in canvas(ctx.date) }
+                // 30 fps while moving (smooth enough, a third of the CPU of 120 Hz); a slow tick while napping
+                // (body re-evaluates each status update)
+                TimelineView(.animation(minimumInterval: napping ? 1 / 12 : 1 / 30)) { ctx in canvas(ctx.date) }
             }
         }
         .frame(width: 76, height: 72)

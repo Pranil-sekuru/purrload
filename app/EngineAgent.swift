@@ -229,7 +229,7 @@ enum EngineAgentPrompt {
     static func confirmUninstall(model: Model) {
         let a = NSAlert()
         a.messageText = "Uninstall Purrload?"
-        let n = model.activeJobs.count
+        let n = model.jobs.filter(\.running).count
         a.informativeText = (n > 0 ? "\(n) download\(n == 1 ? "" : "s") will stop. " : "")
             + "This stops the engine, removes it from login, deletes Purrload's settings and download list, and moves "
             + "the app to the Bin. Files you downloaded stay where they are."

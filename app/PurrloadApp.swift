@@ -22,9 +22,13 @@ struct Job: Decodable, Identifiable {
     var canRetry: Bool? = nil
     var path: String? = nil             // finished: what "Show in Finder" selects
     var stall: String? = nil
+    var held: Bool? = nil               // paused on its own
+    var canPause: Bool? = nil
+    var canCancel: Bool? = nil
 
     var fraction: Double { total > 0 ? min(done / total, 1) : 0 }
-    var active: Bool { ["downloading", "takeover", "failed", "starting", "metadata"].contains(state) }
+    var running: Bool { ["downloading", "takeover", "failed", "starting", "metadata"].contains(state) }
+    var active: Bool { running && held != true }
 }
 
 struct TorrentFile: Decodable, Identifiable {
@@ -69,8 +73,11 @@ let demoStatus: Status = {
                       f(6, "Cosmos Laundromat Player.exe", 3 * mb, "other", [".exe file: not a media file"], blocked: true)]
     var failed = job("Spring", 0.2, 0.3, 0, "corrupt")
     failed.message = "download kept failing; drop the link again to retry"; failed.canRetry = true
-    return Status(updated: now, speed: 4.6 * 1_048_576, paused: false, jobs: [
-        job("Sintel 4K", 1.6, 2.5, 1.9), job("Tears of Steel 4K", 0.9, 2.2, 1.4),
+    var sintel = job("Sintel 4K", 1.6, 2.5, 1.9), tears = job("Tears of Steel 4K", 0.9, 2.2, 0, "downloading")
+    sintel.canPause = true; sintel.canCancel = true
+    tears.canPause = true; tears.canCancel = true; tears.held = true
+    return Status(updated: now, speed: 1.9 * 1_048_576, paused: false, jobs: [
+        sintel, tears,
         choosing, job("Big Buck Bunny 4K", 1.4, 1.4, 0, "verified"), failed,
     ])
 }()
@@ -132,7 +139,9 @@ final class Model: ObservableObject {
         if !useDemoData { Notifier.shared.handle(s.events ?? []) }
         let now = Date()
         let active = activeJobs.count
-        if lastActive > 0 && active == 0 && jobs.contains(where: { $0.state == "verified" }) { celebrateAt = now }
+        if lastActive > 0 && active == 0 && jobs.contains(where: { $0.state == "verified" }) && !jobs.contains(where: { $0.held == true }) {
+            celebrateAt = now
+        }
         lastActive = active
         slowSince = isActive && s.speed < 20_000 ? (slowSince ?? now) : nil
         if flashTitle != nil && now.timeIntervalSince(flashAt) > 4 {
@@ -238,6 +247,15 @@ final class Model: ObservableObject {
     func retry(_ j: Job) {
         guard send(["retry": j.id]) else { return }
         throwInPit(j, resurrect: true)
+    }
+    func setHeld(_ j: Job, _ held: Bool) {
+        guard send([held ? "pause" : "resume": j.id]) else { return }
+        announce(held ? "Paused \(j.name.prefix(20))" : "Resumed \(j.name.prefix(20))")
+    }
+    func cancel(_ j: Job) {
+        guard send(["cancel": j.id]) else { return }
+        picks[j.id] = nil
+        throwInPit(j, resurrect: false)
     }
     func remove(_ j: Job) {
         _ = send(["remove": j.id]); picks[j.id] = nil
@@ -384,6 +402,7 @@ struct Row: View {
         case "choosing": return "\(job.files?.count ?? 0) files · pick what to download"
         case "danger":   return "⚠ " + (job.message ?? "Flagged by the safety check: don't open it")
         default:
+            if job.held == true { return "\(gb(job.done)) of \(gb(job.total)) · paused" }
             if let s = job.stall { return "\(gb(job.done)) of \(gb(job.total)) · \(s)" }
             return "\(gb(job.done)) of \(gb(job.total)) · \(mbs(job.speed)) · \(left(job.eta))"
         }
@@ -413,7 +432,7 @@ struct BarView: View {
         if !model.guardRunning { return "Engine isn't running" }
         if model.status?.paused == true { return "Paused" }
         let n = model.activeJobs.count
-        if n == 0 { return model.jobs.isEmpty ? "All quiet ✦" : "All done ✦" }
+        if n == 0 { return model.jobs.isEmpty ? "All quiet ✦" : model.jobs.contains { $0.held == true } ? "Paused" : "All done ✦" }
         return "\(n) downloading · \(mbs(model.status?.speed ?? 0))"
     }
 
@@ -470,6 +489,7 @@ struct BarView: View {
             Button(model.watchClipboard ? "✓ Offer copied download links" : "Offer copied download links") {
                 model.watchClipboard.toggle()
             }
+            TorrentHandlerMenu(model: model)
             PitMenu()
             EngineMenu(model: model)
             if NotchMetrics.find() != nil { Button("Move to notch") { model.switchMode?() } }
@@ -508,6 +528,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var hoverSince: Double?                       // notch mode: hover to open, move away to close
     var awaySince: Double?
     static let openDelay = 0.12, closeDelay = 0.35
+
+    func application(_ application: NSApplication, open urls: [URL]) { model.open(urls) }
 
     func applicationWillTerminate(_ note: Notification) {
         EngineAgent.stopWithApp()      // only the engine the app runs itself; launchd's keeps going
@@ -1049,6 +1071,39 @@ func selftest(to path: String) {
     m.acceptOffer()
     check("accepting the offer queues it and clears it", m.offer == nil &&
           (((try? FileManager.default.contentsOfDirectory(atPath: inbox.path)) ?? []).count == 6))   // link + select + retry + remove + torrent-with-folder + offer
+    // pause / cancel while running
+    let runningJSON = """
+    {"updated": 0, "speed": 0, "paused": false, "jobs": [{"id": "r1", "name": "r", "title": "r", "state": "downloading", "done": 5,
+     "total": 10, "speed": 0, "eta": null, "folder": "/tmp", "held": true, "canPause": true, "canCancel": true}]}
+    """
+    if let rj = (try? JSONDecoder().decode(Status.self, from: Data(runningJSON.utf8)))?.jobs.first {
+        check("a paused download decodes with its buttons", rj.held == true && rj.canPause == true && rj.canCancel == true)
+        check("a paused download doesn't count as active", rj.running && !rj.active)
+        let before3 = Set((try? FileManager.default.contentsOfDirectory(atPath: inbox.path)) ?? [])
+        m.setHeld(rj, false); m.setHeld(rj, true); m.cancel(rj)
+        let sent = Set((try? FileManager.default.contentsOfDirectory(atPath: inbox.path)) ?? []).subtracting(before3)
+            .compactMap { try? JSONSerialization.jsonObject(with: Data(contentsOf: inbox.appendingPathComponent($0))) as? [String: String] }
+        check("Resume, Pause and Cancel send their requests",
+              Set(sent.flatMap { $0.map { "\($0.key)=\($0.value)" } }) == ["resume=r1", "pause=r1", "cancel=r1"])
+    } else { check("a paused download decodes with its buttons", false) }
+    // opening magnet links and .torrent files
+    let torrentFile = tmp.appendingPathComponent("Show.torrent")
+    try? Data("d4:infod4:name4:Showee".utf8).write(to: torrentFile)
+    let before4 = Set((try? FileManager.default.contentsOfDirectory(atPath: inbox.path)) ?? [])
+    m.open([URL(string: "magnet:?xt=urn:btih:def&dn=Show")!, torrentFile])
+    let opened = Set((try? FileManager.default.contentsOfDirectory(atPath: inbox.path)) ?? []).subtracting(before4)
+        .compactMap { try? JSONSerialization.jsonObject(with: Data(contentsOf: inbox.appendingPathComponent($0))) as? [String: String] }
+        .compactMap { $0["url"] }
+    check("an opened magnet link is queued", opened.contains("magnet:?xt=urn:btih:def&dn=Show"))
+    let kept = opened.first { $0.hasSuffix("Show.torrent") }
+    check("an opened .torrent is copied into Purrload's folder", kept?.hasPrefix(tmp.appendingPathComponent("torrents").path) == true
+          && kept.map { FileManager.default.fileExists(atPath: $0) } == true)
+    let info = Bundle.main.infoDictionary
+    check("the app says it opens magnet links", ((info?["CFBundleURLTypes"] as? [[String: Any]])?.first?["CFBundleURLSchemes"] as? [String]) == ["magnet"])
+    let docTypes = (info?["CFBundleDocumentTypes"] as? [[String: Any]])?.first?["LSItemContentTypes"] as? [String]
+    let declared = (info?["UTImportedTypeDeclarations"] as? [[String: Any]])?.first
+    check("the app says it opens .torrent files", docTypes == [TorrentHandler.torrentType.identifier]
+          && ((declared?["UTTypeTagSpecification"] as? [String: Any])?["public.filename-extension"] as? [String]) == ["torrent"])
     try? FileManager.default.removeItem(at: tmp)
     lines += ["", "TOTAL \(pass)/\(total)"]
     try? lines.joined(separator: "\n").write(toFile: path, atomically: true, encoding: .utf8)

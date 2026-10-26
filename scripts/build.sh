@@ -27,6 +27,25 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleVersion</key><string>$VERSION</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>LSUIElement</key><true/>
+  <key>CFBundleURLTypes</key><array><dict>
+    <key>CFBundleURLName</key><string>Magnet link</string>
+    <key>CFBundleURLSchemes</key><array><string>magnet</string></array>
+  </dict></array>
+  <key>CFBundleDocumentTypes</key><array><dict>
+    <key>CFBundleTypeName</key><string>BitTorrent file</string>
+    <key>CFBundleTypeRole</key><string>Viewer</string>
+    <key>LSHandlerRank</key><string>Default</string>
+    <key>LSItemContentTypes</key><array><string>org.bittorrent.torrent</string></array>
+  </dict></array>
+  <key>UTImportedTypeDeclarations</key><array><dict>
+    <key>UTTypeIdentifier</key><string>org.bittorrent.torrent</string>
+    <key>UTTypeDescription</key><string>BitTorrent file</string>
+    <key>UTTypeConformsTo</key><array><string>public.data</string></array>
+    <key>UTTypeTagSpecification</key><dict>
+      <key>public.filename-extension</key><array><string>torrent</string></array>
+      <key>public.mime-type</key><array><string>application/x-bittorrent</string></array>
+    </dict>
+  </dict></array>
 </dict></plist>
 PLIST
 codesign --force -s - "$APP"     # ad-hoc signature; real releases need a Developer ID + notarization

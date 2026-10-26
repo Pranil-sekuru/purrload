@@ -83,6 +83,7 @@ struct NotchView: View {
             Button(model.watchClipboard ? "✓ Offer copied download links" : "Offer copied download links") {
                 model.watchClipboard.toggle()
             }
+            TorrentHandlerMenu(model: model)
             PitMenu()
             EngineMenu(model: model)
             Button("Move to corner") { model.switchMode?() }
@@ -176,7 +177,7 @@ struct NotchView: View {
         if !model.guardRunning { return "Engine isn't running" }
         if model.status?.paused == true { return "Paused" }
         let n = model.activeJobs.count
-        if n == 0 { return model.jobs.isEmpty ? "All quiet ✦" : "All done ✦" }
+        if n == 0 { return model.jobs.isEmpty ? "All quiet ✦" : model.jobs.contains { $0.held == true } ? "Paused" : "All done ✦" }
         return "\(n) downloading · \(mbs(model.status?.speed ?? 0))"
     }
 }

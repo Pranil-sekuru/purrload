@@ -68,12 +68,28 @@ struct FileRow: View {
     }
 }
 
-/// Retry / Show in Finder / Remove, depending on how the download ended.
+/// Pause / Cancel while it runs; Retry / Show in Finder / Remove, depending on how it ended.
 struct RowActions: View {
     @ObservedObject var model: Model
     let job: Job
 
     var body: some View {
+        if job.canCancel == true {
+            HStack(spacing: 14) {
+                if job.canPause == true {
+                    let held = job.held == true
+                    Button(held ? "Resume" : "Pause") { model.setHeld(job, !held) }.foregroundStyle(Color.lilac)
+                }
+                Button("Cancel") { model.cancel(job) }.foregroundStyle(Color.soft)
+            }
+            .buttonStyle(.plain)
+            .font(.system(size: 11, weight: .semibold))
+        } else {
+            ended
+        }
+    }
+
+    @ViewBuilder var ended: some View {
         let finished = job.state == "verified", failed = job.canRetry == true
         let flagged = job.state == "danger" || job.state == "expired" || (job.state == "corrupt" && !failed)
         if finished || failed || flagged {

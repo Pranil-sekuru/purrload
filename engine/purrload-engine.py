@@ -277,6 +277,9 @@ class DirectJob:
         self.selection = None
         self.chosen = threading.Event()
         self.removed = False
+        self.held = False                # paused on its own; PAUSE pauses everything
+        self.top = None                  # a torrent's file or folder, once it's downloading
+        self.existed = None              # it was there before we started: cancel must not delete it
         self.path = None
         self.message = ""
         self.total = 0
@@ -285,9 +288,10 @@ class DirectJob:
         self.hist = deque(maxlen=12)
         self.last_growth = time.time()
         self.final = None                # kept so a restart resumes the same .part
+        self.seen = 0                    # aria2's last progress: while it's stopped, the file size isn't progress
         if saved:
             self.id = saved["id"]
-            for k in ("folder", "name", "title", "total", "path", "message", "final"):
+            for k in ("folder", "name", "title", "total", "path", "message", "final", "held", "top", "existed", "seen"):
                 if saved.get(k) is not None: setattr(self, k, saved[k])
             if saved.get("selection") is not None:
                 self.selection = saved["selection"]
@@ -300,13 +304,15 @@ class DirectJob:
     def saved(self):
         return {"id": self.id, "url": self.url, "folder": self.folder, "selection": self.selection, "state": self.state,
                 "name": self.name, "title": self.title, "total": self.total, "path": self.path, "message": self.message,
-                "final": self.final}
+                "final": self.final, "held": self.held, "top": self.top, "existed": self.existed, "seen": self.seen}
 
     def done_bytes(self):
         if self.state == "verified":
             return self.total
-        if self.run and ARIA2 and (self.torrent or self.run.total):
-            return self.run.done
+        if self.run and ARIA2 and (self.torrent or self.run.total) and self.run.done:
+            self.seen = self.run.done
+        if ARIA2 and self.seen:
+            return self.seen
         return os.path.getsize(self.part) if self.part and os.path.exists(self.part) else 0
 
     def speed(self):
@@ -320,7 +326,7 @@ class DirectJob:
 
     def stall(self, gateway, now):
         """Why the speed is 0, for the app; None while moving or only briefly at 0."""
-        if self.state != "downloading" or self.speed() > 0 or os.path.exists(PAUSE):
+        if self.state != "downloading" or self.speed() > 0 or self.held or os.path.exists(PAUSE):
             self.zero_since = None
             return None
         self.zero_since = getattr(self, "zero_since", None) or now
@@ -347,6 +353,35 @@ class DirectJob:
         self.title = pretty(name)
         self.name = short(name) if re.search(r"S\d+E\d+", name) else self.title[:40]
 
+    def cancel(self):
+        """Stop it and delete what it downloaded so far. Runs on its own thread: aria2 can take a while to exit."""
+        self.removed = True
+        self.chosen.set()
+        while True:                      # the worker may have started a new run just before it saw `removed`
+            r = self.run
+            if r:
+                r.stop()
+                try: r.proc.wait(60)     # stuck in disk wait: deleting under it would just be rewritten
+                except subprocess.TimeoutExpired: pass
+                if r.alive():
+                    return log(f"{self.name}: aria2 didn't exit; left its files alone")
+            time.sleep(1)
+            if self.run is r:
+                break
+        doomed = []
+        if not self.torrent and self.part:
+            doomed = [self.part, self.part + ".aria2"]
+        elif self.torrent and self.top:
+            doomed = [self.top + ".aria2"] + ([] if self.existed else [self.top])
+        for p in doomed:
+            try:
+                shutil.rmtree(p) if os.path.isdir(p) and not os.path.islink(p) else os.remove(p)
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                log(f"{self.name}: couldn't delete {os.path.basename(p)} ({e})")
+        log(f"{self.name}: cancelled" + (", kept the folder that was already there" if self.torrent and self.existed else ""))
+
     def work(self):
         try:
             if not self.torrent and (problem := folder_problem(self.folder)):   # torrents check once a folder is chosen
@@ -356,19 +391,31 @@ class DirectJob:
             self.fail(f"error: {e}")
 
     def fail(self, msg, state="corrupt"):
+        if self.removed:                 # cancelled: its download stopping isn't a failure
+            return
         self.state, self.message = state, msg
         log(f"{self.name}: {msg}")
         notify("Purrload", f"{self.name}: {msg}")
 
+    def waiting(self):
+        return self.held or os.path.exists(PAUSE)
+
     def attempts(self, make_args, parse, complete, tries=10):
-        for _ in range(tries):
-            while os.path.exists(PAUSE):
-                time.sleep(2)
+        tried = 0
+        while tried < tries:
+            while self.waiting() and not self.removed:
+                time.sleep(1)
+            if self.removed:
+                return False
             self.run = Runner(make_args(), parse)
             self.run.proc.wait()
+            if self.removed:
+                return False
             if complete():
                 return True
-            time.sleep(3)
+            if not self.waiting():       # stopped for a pause: not a failed attempt
+                tried += 1
+                time.sleep(3)
         return False
 
     def work_http(self):
@@ -392,6 +439,8 @@ class DirectJob:
             return self.run.proc.returncode == 0 and (not self.total or os.path.getsize(self.part) == self.total)
         if not self.attempts(make, bool(ARIA2), complete):
             return self.fail("download kept failing; drop the link again to retry")
+        if self.removed:
+            return
         size = os.path.getsize(self.part)
         if final.lower().endswith(VIDEO_EXTS) and not media_ok(self.part):
             return self.fail("finished, but it isn't a valid video file")
@@ -455,6 +504,9 @@ class DirectJob:
         sel = ",".join(map(str, picked))
         self.total = sum(f["size"] for f in self.files if f["index"] in picked)
         self.files = None
+        if self.existed is None:
+            self.top = os.path.join(self.folder, name)
+            self.existed = os.path.exists(self.top)
         self.state = "downloading"
         log(f"{self.name}: torrent, fetching {len(picked)} chosen file(s)")
         make = lambda: [ARIA2, "-d", self.folder, "-T", tor, f"--select-file={sel}", "--bt-remove-unselected-file=true",
@@ -462,6 +514,8 @@ class DirectJob:
                         "--console-log-level=error", "--summary-interval=0", *TORRENT_SPEED, *piece_order(self.folder)]
         if not self.attempts(make, True, lambda: self.run.proc.returncode == 0):
             return self.fail("torrent download kept failing")
+        if self.removed:
+            return
         check = subprocess.run([sys.executable, "-I", INSPECT, "check", os.path.join(self.folder, name)],
                                capture_output=True, text=True, env={**os.environ, "PURRLOAD_QUIET": "1"})
         if check.returncode == 1:
@@ -633,7 +687,8 @@ class Engine:
                 j.warned.add("expiry")
 
     def active(self):
-        return [j for j in self.jobs.values() if j.state in ("downloading", "failed", "takeover", "starting", "metadata")]
+        return [j for j in self.jobs.values() if j.state in ("downloading", "failed", "takeover", "starting", "metadata")
+                and not getattr(j, "held", False)]
 
     def keep_awake(self):
         if self.active() and (self.caff is None or self.caff.poll() is not None):
@@ -648,12 +703,13 @@ class Engine:
         tot_sp, items = 0, []
         for j in self.jobs.values():
             if isinstance(j, DirectJob):
-                size, sp = j.done_bytes(), j.speed() if j.state == "downloading" else 0
+                size, sp = j.done_bytes(), j.speed() if j.state == "downloading" and not j.held else 0
                 tot_sp += sp
                 items.append({"id": j.id, "name": j.name, "title": j.title, "state": j.state, "done": size,
                               "total": j.total, "speed": sp, "eta": (j.total - size) / sp if sp > 0 and j.total else None,
                               "folder": j.folder, "message": j.message, "files": j.files if j.state == "choosing" else None,
-                              "canRetry": j.state in ("corrupt", "skipped"), "path": j.path,
+                              "canRetry": j.state in ("corrupt", "skipped"), "path": j.path, "held": j.held,
+                              "canPause": j.state == "downloading", "canCancel": j.state in ("starting", "metadata", "downloading"),
                               "stall": j.stall(self.gateway, time.time())})
                 rows.append(f"{j.name[:8]:8} {j.state:11} {100 * size / j.total if j.total else 0:5.1f}%  "
                             f"{fmt_bytes(size):>9} / {fmt_bytes(j.total):<9} {sp / 1048576:5.2f} MB/s")
@@ -704,6 +760,17 @@ class Engine:
                     n = DirectJob(j.url)
                     self.jobs[n.id] = n
                     log(f"{j.name}: retrying")
+            elif "pause" in msg or "resume" in msg:
+                j = self.jobs.get(msg.get("pause") or msg.get("resume"))
+                if isinstance(j, DirectJob) and j.held != ("pause" in msg):
+                    j.held = "pause" in msg
+                    log(f"{j.name}: {'paused' if j.held else 'resumed'}")
+            elif "cancel" in msg:
+                j = self.jobs.get(msg["cancel"])
+                if isinstance(j, DirectJob) and j.state in ("starting", "metadata", "downloading", "choosing"):
+                    self.removed.add(j.id)
+                    del self.jobs[j.id]
+                    threading.Thread(target=j.cancel, daemon=True).start()
             elif "remove" in msg:
                 j = self.jobs.get(msg["remove"])
                 if j and j.state not in ("downloading", "takeover", "failed", "metadata", "starting"):
@@ -729,8 +796,10 @@ class Engine:
         if not j.hist or size > j.hist[-1][1] or (j.run and j.run.parsed and j.run.speed > 0):
             j.last_growth = now
         j.hist.append((now, size))
-        if self.paused and j.run:
-            j.run.stop()              # the worker waits for PAUSE to go away, then resumes
+        if self.paused or j.held:
+            j.last_growth = now       # time spent paused isn't a hang
+            if j.run:
+                j.run.stop()          # the worker waits for the pause to end, then resumes
         elif j.state == "downloading" and j.run and j.run.alive() and \
                 now - j.last_growth > (TORRENT_HANG_SECS if j.torrent else DIRECT_HANG_SECS):
             log(f"{j.name}: no bytes for {TORRENT_HANG_SECS if j.torrent else DIRECT_HANG_SECS}s, restarting")

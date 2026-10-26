@@ -6,7 +6,8 @@ extension Model {
     static let defaultFolder = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Downloads").path
 
     var downloadFolder: String {
-        get { UserDefaults.standard.string(forKey: "downloadFolder") ?? Model.defaultFolder }
+        // --demo shows the default, never your own folders (screenshots go in the README)
+        get { useDemoData ? Model.defaultFolder : UserDefaults.standard.string(forKey: "downloadFolder") ?? Model.defaultFolder }
         set {
             UserDefaults.standard.set(newValue, forKey: "downloadFolder")
             var recent = recentFolders.filter { $0 != newValue }
@@ -17,7 +18,9 @@ extension Model {
         }
     }
 
-    var recentFolders: [String] { UserDefaults.standard.stringArray(forKey: "recentFolders") ?? [Model.defaultFolder] }
+    var recentFolders: [String] {
+        useDemoData ? [Model.defaultFolder] : UserDefaults.standard.stringArray(forKey: "recentFolders") ?? [Model.defaultFolder]
+    }
 
     func writeSettings() {
         guard let data = try? JSONSerialization.data(withJSONObject: ["downloadFolder": downloadFolder]) else { return }

@@ -20,6 +20,8 @@ Purrload keeps your Safari downloads alive. It stops your Mac from sleeping mid-
 - Web downloads go to `~/Downloads` (8 connections per file with aria2, otherwise curl), with the same resume, retry and network-switch recovery.
 - **Pick what you want from a torrent.** Before anything downloads, the notch shows every file with a tick box. Video, audio and subtitles are ticked for you, extras like posters or `.nfo` files can be added, and anything the safety check flags (disguised apps, `.exe` files, double extensions) is locked with the reason shown.
 - After downloading, torrents are checked again by content and get the quarantine mark.
+- **Click a magnet link or open a `.torrent` file** and it goes straight to Purrload. If another torrent app is set as the default, right-click → **Open magnet links and .torrent files** to switch back.
+- Running downloads get **Pause** and **Cancel**. A paused download stays paused after a restart, and lets the Mac sleep. Cancel deletes what was downloaded so far, but never a torrent folder that was already there before.
 - Finished downloads get **Show in Finder**, failed ones get **Retry**, and both can be cleared with **Remove**.
 
 **Choose where downloads go**
@@ -92,7 +94,7 @@ The install script:
 | `purr --resume` | Continue an interrupted `purr` run |
 | `purr "magnet:?…"` or `purr file.torrent` | Safe torrent download (`--to DIR`, `--seed`, `--all`, `--trust`) |
 
-- **Pause everything:** right-click the notch or bar, or create a `PAUSE` file in the data folder (handy on metered data).
+- **Pause one download:** click **Pause** on its row. **Pause everything:** right-click the notch or bar, or create a `PAUSE` file in the data folder (handy on metered data).
 - **Pet the kitty:** click it.
 
 ## How it works
@@ -129,8 +131,6 @@ The stress test opens and closes the notch or bar 60 times like real clicks, at 
 ## Roadmap
 
 - Safari extension: "Download with Purrload" in the right-click menu (needs Xcode)
-- Register as the handler for `magnet:` links and `.torrent` files, so clicking them in Safari opens Purrload
-- Pause and cancel for individual downloads while they're running
 - Swift download engine built on aria2's remote-control (JSON-RPC) interface, replacing the Python engine
 - Settings window: download folder, connections, speed limit, auto-pause on mobile hotspot data
 - Signed and notarized releases, Homebrew cask, automatic updates
